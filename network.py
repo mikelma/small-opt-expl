@@ -25,8 +25,8 @@ class RnnPolicy(eqx.Module):
         self,
         key: PRNGKeyArray,
         obs: Float[Array, "view_size view_size"],
-        hstate: Float[Array, "hstate"],
-    ) -> tuple[Integer[ScalarLike, ""], Float[Array, "hstate"]]:
+        hstate: Float[Array, "{self.rnn.hidden_size}"],
+    ) -> tuple[Integer[ScalarLike, ""], Float[Array, "{self.rnn.hidden_size}"]]:
         x = obs.flatten()
         x = jax.nn.relu(self.in_layer(x))
 
