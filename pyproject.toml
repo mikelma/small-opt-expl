@@ -1,0 +1,18 @@
+[project]
+name = "simple-opt-expl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "equinox>=0.13.2",
+    "flax>=0.12.1",
+    "jax>=0.8.1",
+    "jaxtyping>=0.3.3",
+    "matplotlib>=3.10.7",
+    "small-world",
+    "tyro>=0.9.35",
+]
+
+[tool.uv.sources]
+small-world = { git = "https://github.com/mikelma/small-world.git" }
