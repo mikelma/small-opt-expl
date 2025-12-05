@@ -4,6 +4,7 @@ import tyro
 from dataclasses import dataclass
 import equinox as eqx
 from small_world.envs.from_map import FromMap
+from small_world.envs.simple import Simple
 from small_world.environment import Environment, EnvParams, Timestep
 from flax import struct
 from functools import partial
@@ -72,7 +73,6 @@ class Args:
     seed: int = 42
 
 
-@jaxtyped(typechecker=typechecker)
 @struct.dataclass
 class Interaction:
     observation: Float[Array, "*batch view_size view_size"]
@@ -101,7 +101,8 @@ def convert_bfloat16(module: eqx.Module) -> eqx.Module:
 def build_rollout(
     env: Environment, env_params: EnvParams, num_timesteps: int = 100
 ) -> Callable:
-    def _rollout(key: jax.Array, policy: RnnPolicy):
+    @eqx.filter_jit
+    def _rollout(key: PRNGKeyArray, policy: RnnPolicy) -> Interaction:
         def _step(
             carry: tuple[Timestep, Float[Array, "{policy.rnn.hidden_size}"]],
             key_step: PRNGKeyArray,
@@ -113,14 +114,13 @@ def build_rollout(
             key_step, key_action = jax.random.split(key_step)
             observation = timestep.observations[0]
             action, hstate = policy(key_action, observation, hstate)
-            actions = jnp.asarray((action,))
+            actions = jnp.expand_dims(action, axis=0)
             timestep = env.step(
                 key_step,
                 env_params,
                 timestep,
                 actions,
             )
-
             interaction = Interaction(
                 observation=observation,
                 next_observation=timestep.observations[0],
@@ -272,8 +272,11 @@ if __name__ == "__main__":
 
     key = jax.random.key(args.seed)
 
-    env = FromMap()
-    env_params = env.default_params(file_name=args.env.file_name)
+    # env = FromMap()
+    # env_params = env.default_params(file_name=args.env.file_name)
+
+    env = Simple()
+    env_params = env.default_params(num_agents=1)
 
     # Generate the population
     key, key_pop = jax.random.split(key)
@@ -302,18 +305,23 @@ if __name__ == "__main__":
         param_count // args.eda.population_size,
     )
 
-    compute_fitness_fn = partial(compute_fitness, env_params=env_params, wm_cfg=args.wm)
-    batched_compute_fs = jax.vmap(compute_fitness_fn)
+    # compute_fitness_fn = partial(compute_fitness, env_params=env_params, wm_cfg=args.wm)
+    batched_compute_fs = jax.vmap(compute_fitness, in_axes=(0, None, 0, None))
 
     for it in range(args.eda.num_generations):
         key, key_rolls, key_fs, key_eda = jax.random.split(key, num=4)
 
         keys_rolls = jax.random.split(key_rolls, args.eda.population_size)
-        interactions = jax.vmap(rollout_fn)(keys_rolls, population)
+        interactions = eqx.filter_vmap(rollout_fn)(keys_rolls, population)
 
         print("*** TODO *** Implement repeated fitness calculations")
         keys_fs = jax.random.split(key_fs, num=args.eda.population_size)
-        fitness = batched_compute_fs(key=keys_fs, interactions=interactions)
+        fitness = batched_compute_fs(
+            keys_fs,
+            env_params,
+            interactions,
+            args.wm,
+        )
         avg_fitness = fitness.sum(-1)
 
         print(
