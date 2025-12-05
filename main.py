@@ -7,6 +7,8 @@ from small_world.envs.from_map import FromMap
 from small_world.environment import Environment, EnvParams
 from flax import struct
 from functools import partial
+import optax
+from typing import Optional
 
 from typing import Any
 from jaxtyping import (
@@ -16,12 +18,14 @@ from jaxtyping import (
     PRNGKeyArray,
     ScalarLike,
     install_import_hook,
+    jaxtyped,
 )
+from beartype import beartype as typechecker
 
 with install_import_hook("network", "beartype.beartype"):
-    from network import RnnPolicy
+    from network import RnnPolicy, WorldModel
 
-from eda import generate_eda_state, EdaConfig
+from eda import generate_eda_state, EdaConfig, eda_sample
 
 
 @dataclass
@@ -39,21 +43,42 @@ class PolicyConfig:
     """Use bfloat16 for the weights"""
 
 
+class WorldModelConfig(eqx.Module):
+    hdim: int = 128
+    """size of the hidden layers"""
+
+    batch_size: int = 16
+    """training batch size"""
+
+    num_batches: int = 4
+    """number of batches to train at each train iteration"""
+
+    num_iterations: int = 20
+    """number of total updates in training"""
+
+    eval_batch_size: int = 128
+    """evaluation batch size"""
+
+    learning_rate: float = 0.001
+
+
 @dataclass
 class Args:
     env: EnvConfig
     eda: EdaConfig
     policy: PolicyConfig
+    wm: WorldModelConfig
 
     seed: int = 42
 
 
+@jaxtyped(typechecker=typechecker)
 @struct.dataclass
 class Interaction:
-    observation: Float[Array, "view_size view_size"]
-    next_observation: Float[Array, "view_size view_size"]
-    action: Integer[ScalarLike, ""]
-    position: Integer[Array, "2"]
+    observation: Float[Array, "*batch view_size view_size"]
+    next_observation: Float[Array, "*batch view_size view_size"]
+    action: Integer[ScalarLike, "*batch"]
+    position: Integer[Array, "*batch 2"]
 
 
 def generate_population(
@@ -92,10 +117,10 @@ def build_rollout(env: Environment, env_params: EnvParams, num_timesteps: int = 
             )
 
             interaction = Interaction(
-                observation,
-                action,
-                timestep.observations[0],
-                timestep.state.agents_pos[0],
+                observation=observation,
+                next_observation=timestep.observations[0],
+                action=action,
+                position=timestep.state.agents_pos[0],
             )
             return [timestep, hstate], interaction
 
@@ -111,6 +136,128 @@ def build_rollout(env: Environment, env_params: EnvParams, num_timesteps: int = 
         return interactions
 
     return _rollout
+
+
+@jaxtyped(typechecker=typechecker)
+def random_batch_indices(
+    key: PRNGKeyArray,
+    batch_size: int,
+    num_batches: int,
+    dataset_len: int,
+    sequential: bool = True,
+) -> Integer[Array, "{num_batches} {batch_size}"]:
+    """Example output for batch_size=8, num_bathes=3, dataset_len: 100, and sequential=True:
+        [[10  5  4  4 10 25  1  7]  # indices in [0, 33)
+         [26 28 46 21 23 33 64 58]  # indices in [0, 66)
+         [30 76 59 20 18 54 57 79]] # indices in [0, 99)
+
+    Example output for the same arguments except sequential=False:
+        [[91 61 47 17 86 24 37 97]
+         [22 22 96 35 51 87 12 70]
+         [59 34 63 55 36 62 65 34]].
+    """
+
+    def batch_idx(batch_key, batch_id):
+        upper = jax.lax.select(
+            sequential,
+            on_true=(batch_id + 1) * (dataset_len // num_batches),
+            on_false=dataset_len,
+        )
+
+        return jax.random.randint(batch_key, (batch_size,), 0, upper)
+
+    keys = jax.random.split(key, num_batches)
+    batch_ids = jnp.arange(num_batches)
+    return jax.vmap(batch_idx)(keys, batch_ids)
+
+
+@jaxtyped(typechecker=typechecker)
+def compute_fitness(
+    key: PRNGKeyArray,
+    env_params: EnvParams,
+    interactions: Interaction,
+    wm_cfg: WorldModelConfig,
+):
+    @partial(jax.vmap, in_axes=(None, None, 0))
+    def _batched_loss_fn(model, data, batch_idx):
+        obs = data.observation[batch_idx]
+        act = data.action[batch_idx]
+        tgt = data.next_observation[batch_idx]
+        pred = model(obs, act)
+
+        loss = optax.losses.squared_error(pred, tgt)
+        return loss
+
+    def _avg_loss(model, data, batch_idx):
+        losses = _batched_loss_fn(model, data, batch_idx)
+        return losses.mean()
+
+    def _train_batch(carry, batch_idx):
+        model, optim_state = carry
+
+        loss, grads = eqx.filter_value_and_grad(_avg_loss)(
+            model, interactions, batch_idx
+        )
+
+        updates, opt_state = optim.update(
+            grads, optim_state, eqx.filter(model, eqx.is_array)
+        )
+
+        model = eqx.apply_updates(model, updates)
+
+        new_carry = (model, optim_state)
+        return new_carry, loss
+
+    def _train_eval_step(carry, batch_indices):
+        model, optim_state, key = carry
+
+        # Scan across num_batches. `batch_indices` shape: (num_batches, batch_size).
+        train_out, losses = jax.lax.scan(
+            _train_batch, (model, optim_state), batch_indices
+        )
+        model, optim_state = train_out
+
+        eval_loss = losses.mean()  # TODO eval the model in the test data here
+
+        # key, key_batch = jax.random.split(key)
+        # eval_idx = random_batch_indices(
+        #     key_batch, wm_cfg.eval_batch_size, 1, eval_dataset.action.shape[0]
+        # )[0]
+        # eval_loss = _avg_loss(model, eval_dataset, eval_idx)
+
+        carry = (model, optim_state, key)
+
+        return carry, eval_loss
+
+    key_wm, key_batches, key_eval = jax.random.split(key, 3)
+
+    # Initialize the world model and optimizer
+    model = WorldModel(
+        key_wm,
+        hdim=wm_cfg.hdim,
+        obs_dim=env_params.view_size**2,
+        num_actions=env_params.num_actions,
+    )
+    optim = optax.adamw(wm_cfg.learning_rate)
+    optim_state = optim.init(eqx.filter(model, eqx.is_array))
+
+    # Pre-compute training batch indices. shape: (iters, num_batches, batch_size)
+    dataset_len = interactions.observation.shape[0]
+    batches = random_batch_indices(
+        key_batches,
+        wm_cfg.batch_size * wm_cfg.num_batches,
+        wm_cfg.num_iterations,
+        dataset_len,
+    )
+    batches = batches.reshape(
+        wm_cfg.num_iterations, wm_cfg.num_batches, wm_cfg.batch_size
+    )
+
+    # Run the world model train-eval loop
+    carry = (model, optim_state, key_eval)
+    _carry, eval_losses = jax.lax.scan(_train_eval_step, carry, batches)
+
+    return eval_losses
 
 
 if __name__ == "__main__":
@@ -148,11 +295,36 @@ if __name__ == "__main__":
         param_count // args.eda.population_size,
     )
 
+    compute_fitness_fn = partial(compute_fitness, env_params=env_params, wm_cfg=args.wm)
+    batched_compute_fs = jax.vmap(compute_fitness_fn)
+
     for it in range(args.eda.num_generations):
-        key, key_rolls, key_fs = jax.random.split(key, num=3)
+        key, key_rolls, key_fs, key_eda = jax.random.split(key, num=4)
 
         keys_rolls = jax.random.split(key_rolls, args.eda.population_size)
         interactions = jax.vmap(rollout_fn)(keys_rolls, population)
 
-        print(interactions.observation.shape)
-        quit()
+        print("*** TODO *** Implement repeated fitness calculations")
+        keys_fs = jax.random.split(key_fs, num=args.eda.population_size)
+        fitness = batched_compute_fs(key=keys_fs, interactions=interactions)
+        avg_fitness = fitness.mean(-1)
+
+        print(
+            f"{it + 1}/{args.eda.num_generations} fitness:",
+            fitness.mean(),
+            ", min:",
+            fitness.min(),
+            ", max:",
+            fitness.max(),
+        )
+
+        # Generate new solutions
+        ranking = jnp.argsort(avg_fitness)
+        eda_state, population = eda_sample(
+            key_eda,
+            eda_state,
+            population,
+            ranking,
+            elite_ratio=args.eda.elite_ratio,
+            learning_rate=args.eda.learning_rate,
+        )
