@@ -37,63 +37,47 @@ class RnnPolicy(eqx.Module):
             x = jax.nn.relu(layer(x))
 
         logits = self.layers[-1](x)
-        return jax.random.categorical(key, logits), hstate
+        action = jax.random.categorical(key, logits)
+        return action, hstate
 
 
 class WorldModel(eqx.Module):
-    tile_embed: eqx.Module
-    color_embed: eqx.Module
-    action_embed: eqx.Module
     layers: tuple
-    square: int = eqx.field(static=True)
+    act_emb: eqx.Module
 
-    def __init__(self, key, hdim=512, embed_dim=16, view_grid_size=5):
-        kl1, kl2, kem1, kem2, kem3 = jax.random.split(key, 5)
+    def __init__(
+        self,
+        key: PRNGKeyArray,
+        obs_dim: int,
+        num_actions: int,
+        hdim: int = 64,
+        act_emb_size: int = 16,
+    ):
+        kemb, kl0, kl1, kl2 = jax.random.split(key, 4)
 
-        self.tile_embed = eqx.nn.Embedding(
-            num_embeddings=NUM_TILES,
-            embedding_size=embed_dim,
-            key=kem1,
-        )
-        self.color_embed = eqx.nn.Embedding(
-            num_embeddings=NUM_COLORS,
-            embedding_size=embed_dim,
-            key=kem2,
-        )
-
-        self.action_embed = eqx.nn.Embedding(
-            num_embeddings=NUM_ACTIONS,
-            embedding_size=embed_dim,
-            key=kem3,
+        self.act_emb = eqx.nn.Embedding(
+            num_embeddings=num_actions, embedding_size=act_emb_size, key=kemb
         )
 
-        self.square = view_grid_size * view_grid_size
-        in_dim = self.square * embed_dim * 2
         self.layers = (
-            eqx.nn.Linear(in_dim + embed_dim, hdim, key=kl1),
-            eqx.nn.Linear(
-                hdim, self.square * NUM_TILES + self.square * NUM_COLORS, key=kl2
-            ),
+            eqx.nn.Linear(obs_dim + act_emb_size, hdim, key=kl0),
+            eqx.nn.Linear(hdim, hdim, key=kl1),
+            eqx.nn.Linear(hdim, obs_dim, key=kl2),
         )
 
-    def __call__(self, obs, act):
-        tiles, colors = obs[:, :, 0].ravel(), obs[:, :, 1].ravel()
+    def __call__(
+        self,
+        obs: Float[Array, "view_size view_size"],
+        action: Integer[ScalarLike, ""],
+    ) -> Float[Array, "view_size view_size"]:
+        flat_obs = obs.ravel()  # flatten observations
+        emb_act = self.act_emb(action)
 
-        emb_tiles = jax.vmap(self.tile_embed)(tiles)
-        emb_colors = jax.vmap(self.color_embed)(colors)
-
-        emb_act = self.action_embed(act)
-
-        x = jnp.hstack((emb_tiles.reshape(-1), emb_colors.reshape(-1), emb_act))
+        x = jnp.hstack((flat_obs, emb_act))
 
         for layer in self.layers[:-1]:
-            x = jax.nn.relu(layer(x))
+            x = jax.nn.relu(layer(x))  # TODO use tanh?
 
-        logits = self.layers[-1](x)
-
-        tile_logits = logits[: NUM_TILES * self.square].reshape(self.square, NUM_TILES)
-        colors_logits = logits[-NUM_COLORS * self.square :].reshape(
-            self.square, NUM_COLORS
-        )
-
-        return tile_logits, colors_logits
+        pred = jax.nn.tanh(self.layers[-1](x))
+        pred = pred.reshape(*obs.shape)
+        return pred
