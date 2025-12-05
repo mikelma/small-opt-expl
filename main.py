@@ -4,11 +4,11 @@ import tyro
 from dataclasses import dataclass
 import equinox as eqx
 from small_world.envs.from_map import FromMap
-from small_world.environment import Environment, EnvParams
+from small_world.environment import Environment, EnvParams, Timestep
 from flax import struct
 from functools import partial
 import optax
-from typing import Optional
+from typing import Optional, Callable
 
 from typing import Any
 from jaxtyping import (
@@ -98,17 +98,22 @@ def convert_bfloat16(module: eqx.Module) -> eqx.Module:
     return eqx.combine(params, static)
 
 
-def build_rollout(env: Environment, env_params: EnvParams, num_timesteps: int = 100):
+def build_rollout(
+    env: Environment, env_params: EnvParams, num_timesteps: int = 100
+) -> Callable:
     def _rollout(key: jax.Array, policy: RnnPolicy):
-        def _step(carry, key_step):
+        def _step(
+            carry: tuple[Timestep, Float[Array, "{policy.rnn.hidden_size}"]],
+            key_step: PRNGKeyArray,
+        ) -> tuple[
+            list[Timestep, Float[Array, "{policy.rnn.hidden_size}"]], Interaction
+        ]:
             timestep, hstate = carry
 
             key_step, key_action = jax.random.split(key_step)
             observation = timestep.observations[0]
             action, hstate = policy(key_action, observation, hstate)
-            actions = action.reshape(
-                1,
-            )
+            actions = jnp.asarray((action,))
             timestep = env.step(
                 key_step,
                 env_params,
@@ -171,6 +176,7 @@ def random_batch_indices(
     return jax.vmap(batch_idx)(keys, batch_ids)
 
 
+@eqx.filter_jit
 @jaxtyped(typechecker=typechecker)
 def compute_fitness(
     key: PRNGKeyArray,
@@ -218,6 +224,7 @@ def compute_fitness(
         model, optim_state = train_out
 
         eval_loss = losses.mean()  # TODO eval the model in the test data here
+        print("\n*** EVAL IN TRAIN DATA ***\n")
 
         # key, key_batch = jax.random.split(key)
         # eval_idx = random_batch_indices(
@@ -307,7 +314,7 @@ if __name__ == "__main__":
         print("*** TODO *** Implement repeated fitness calculations")
         keys_fs = jax.random.split(key_fs, num=args.eda.population_size)
         fitness = batched_compute_fs(key=keys_fs, interactions=interactions)
-        avg_fitness = fitness.mean(-1)
+        avg_fitness = fitness.sum(-1)
 
         print(
             f"{it + 1}/{args.eda.num_generations} fitness:",
