@@ -17,6 +17,8 @@ class EdaConfig:
 
     population_size: int = 8
 
+    num_fs_repes: int = 4
+
     elite_ratio: float = 0.5
     """ratio of the solutions to consider elite"""
 

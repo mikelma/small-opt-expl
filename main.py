@@ -10,6 +10,7 @@ from flax import struct
 from functools import partial
 import optax
 from typing import Optional, Callable
+import matplotlib.pyplot as plt
 
 from typing import Any
 from jaxtyping import (
@@ -71,6 +72,9 @@ class Args:
     wm: WorldModelConfig
 
     seed: int = 42
+
+    wandb: bool = False
+    wandb_project_name: str = "small-opt-expl"
 
 
 @struct.dataclass
@@ -267,8 +271,75 @@ def compute_fitness(
     return eval_losses
 
 
+@eqx.filter_jit
+@jaxtyped(typechecker=typechecker)
+def compute_fitness_repetitions(
+    key: PRNGKeyArray,
+    population: RnnPolicy,
+    env_params: EnvParams,
+    population_size: int,
+    num_repetitions: int,
+    wm_cfg: WorldModelConfig,
+) -> tuple[
+    Float[
+        Array,
+        "{num_repetitions} {population_size} {wm_cfg.num_iterations}",
+    ],
+    Interaction,
+]:
+    def one_population_eval(key: PRNGKeyArray):
+        key_roll, key_fs = jax.random.split(key)
+
+        # generate a rollout for each policy in the population
+        keys_rolls = jax.random.split(key_roll, population_size)
+        interactions = eqx.filter_vmap(rollout_fn)(keys_rolls, population)
+
+        # evaluate the population based on the collected iterations
+        keys_fs = jax.random.split(key_fs, population_size)
+        batched_compute_fs = jax.vmap(compute_fitness, in_axes=(0, None, 0, None))
+        fitnesses = batched_compute_fs(keys_fs, env_params, interactions, wm_cfg)
+        return fitnesses, interactions
+
+    repeated_population_eval = eqx.filter_vmap(one_population_eval)
+
+    keys = jax.random.split(key, num_repetitions)
+    many_fs, many_interactions = repeated_population_eval(keys)
+    return many_fs, many_interactions
+
+
+def plot_eval_losses(losses, fitness, fig, ax, ymax, cmap="viridis_r"):
+    pop_size = losses.shape[1]
+    norm_fs = fitness - fitness.min()
+    norm_fs /= norm_fs.max()
+
+    cmap = plt.get_cmap(cmap)
+    colors = cmap(norm_fs)
+
+    xx = jnp.arange(losses.shape[-1])
+    for i in range(pop_size):
+        loss_avg = losses[:, i, :].mean(0)
+        loss_std = losses[:, i, :].std(0)
+        ax.plot(xx, loss_avg, color=colors[i], label=str(round(fitness[i], 3)))
+        ax.fill_between(
+            xx, loss_avg - loss_std, loss_avg + loss_std, alpha=0.3, color=colors[i]
+        )
+
+    ax.set_ylim(0, ymax)
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
+
+    if args.wandb:
+        import wandb
+        import time
+
+        run_name = f"Env__{args.seed}__{int(time.time())}"
+        wandb.init(
+            project=args.wandb_project_name,
+            config=vars(args),
+            name=run_name,
+        )
 
     key = jax.random.key(args.seed)
 
@@ -305,24 +376,21 @@ if __name__ == "__main__":
         param_count // args.eda.population_size,
     )
 
-    # compute_fitness_fn = partial(compute_fitness, env_params=env_params, wm_cfg=args.wm)
-    batched_compute_fs = jax.vmap(compute_fitness, in_axes=(0, None, 0, None))
+    fig, ax = plt.subplots()
+    ymax = None
 
     for it in range(args.eda.num_generations):
-        key, key_rolls, key_fs, key_eda = jax.random.split(key, num=4)
+        key, key_eval, key_eda = jax.random.split(key, num=3)
 
-        keys_rolls = jax.random.split(key_rolls, args.eda.population_size)
-        interactions = eqx.filter_vmap(rollout_fn)(keys_rolls, population)
-
-        print("*** TODO *** Implement repeated fitness calculations")
-        keys_fs = jax.random.split(key_fs, num=args.eda.population_size)
-        fitness = batched_compute_fs(
-            keys_fs,
-            env_params,
-            interactions,
-            args.wm,
+        batched_losses, _interactions = compute_fitness_repetitions(
+            key=key_eval,
+            env_params=env_params,
+            population=population,
+            num_repetitions=args.eda.num_fs_repes,
+            population_size=args.eda.population_size,
+            wm_cfg=args.wm,
         )
-        avg_fitness = fitness.sum(-1)
+        fitness = batched_losses.sum(-1).mean(0)
 
         print(
             f"{it + 1}/{args.eda.num_generations} fitness:",
@@ -332,9 +400,24 @@ if __name__ == "__main__":
             ", max:",
             fitness.max(),
         )
+        if args.wandb:
+            wandb.log(
+                {
+                    "mean fs": fitness.mean(),
+                    "max fs": fitness.max(),
+                    "min fs": fitness.min(),
+                },
+                step=it,
+            )
+
+        ymax = batched_losses.max() if ymax is None else ymax
+        plt.cla()
+        plot_eval_losses(batched_losses, fitness, fig, ax, ymax)
+        # plt.savefig(f"videos/losses_{it + 1}.png")
+        plt.pause(1e-7)
 
         # Generate new solutions
-        ranking = jnp.argsort(avg_fitness)
+        ranking = jnp.argsort(fitness)
         eda_state, population = eda_sample(
             key_eda,
             eda_state,

@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib>=3.10.7",
     "small-world",
     "tyro>=0.9.35",
+    "wandb>=0.23.1",
 ]
 
 [tool.uv.sources]
