@@ -343,11 +343,8 @@ if __name__ == "__main__":
 
     key = jax.random.key(args.seed)
 
-    # env = FromMap()
-    # env_params = env.default_params(file_name=args.env.file_name)
-
-    env = Simple()
-    env_params = env.default_params(num_agents=1)
+    env = FromMap()
+    env_params = env.default_params(file_name=args.env.file_name)
 
     # Generate the population
     key, key_pop = jax.random.split(key)
