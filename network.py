@@ -50,6 +50,7 @@ class WorldModel(eqx.Module):
         key: PRNGKeyArray,
         obs_dim: int,
         num_actions: int,
+        seq_len: int,
         hdim: int = 64,
         act_emb_size: int = 16,
     ):
@@ -59,25 +60,29 @@ class WorldModel(eqx.Module):
             num_embeddings=num_actions, embedding_size=act_emb_size, key=kemb
         )
 
+        in_dim = seq_len * (obs_dim + act_emb_size)
         self.layers = (
-            eqx.nn.Linear(obs_dim + act_emb_size, hdim, key=kl0),
+            eqx.nn.Linear(in_dim, hdim, key=kl0),
             eqx.nn.Linear(hdim, hdim, key=kl1),
             eqx.nn.Linear(hdim, obs_dim, key=kl2),
         )
 
     def __call__(
         self,
-        obs: Float[Array, "view_size view_size"],
-        action: Integer[ScalarLike, ""],
+        obs: Float[Array, "seq_len view_size view_size"],
+        action: Integer[ScalarLike, "seq_len"],
     ) -> Float[Array, "view_size view_size"]:
-        flat_obs = obs.ravel()  # flatten observations
-        emb_act = self.act_emb(action)
+        flat_obs = obs.ravel()  # flatten the sequence of observations
+        emb_act = jax.vmap(self.act_emb)(action).ravel()
 
         x = jnp.hstack((flat_obs, emb_act))
 
         for layer in self.layers[:-1]:
             x = jax.nn.relu(layer(x))  # TODO use tanh?
 
+        # NOTE assuming targets are always in the [-1, 1] range
         pred = jax.nn.tanh(self.layers[-1](x))
-        pred = pred.reshape(*obs.shape)
+
+        # reshape output to the shape of observations (ignore seq_len dim)
+        pred = pred.reshape(*obs.shape[1:])
         return pred

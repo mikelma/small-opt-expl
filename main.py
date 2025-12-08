@@ -29,6 +29,14 @@ with install_import_hook("network", "beartype.beartype"):
 
 from eda import generate_eda_state, EdaConfig, eda_sample
 
+# persistent compilation cache
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+jax.config.update(
+    "jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir"
+)
+
 
 @dataclass
 class EnvConfig:
@@ -62,6 +70,9 @@ class WorldModelConfig(eqx.Module):
     """evaluation batch size"""
 
     learning_rate: float = 0.001
+
+    seq_len: int = 8
+    """number of observations to include as input"""
 
 
 @dataclass
@@ -190,8 +201,22 @@ def compute_fitness(
 ):
     @partial(jax.vmap, in_axes=(None, None, 0))
     def _batched_loss_fn(model, data, batch_idx):
-        obs = data.observation[batch_idx]
-        act = data.action[batch_idx]
+        # take the last M number of observations starting from `batch_idx`.
+        seq_idx = batch_idx - jnp.arange(wm_cfg.seq_len)[::-1]
+        # if `batch_idx` is lower than wm.seq_len then (i.e., there're no
+        # prev steps), fill the missing obs and acts with zeros.
+        obs_shape = data.observation.shape[1:]
+        mask = jnp.broadcast_to(
+            (seq_idx >= 0)[:, None, None], (wm_cfg.seq_len, *obs_shape)
+        )
+        obs = jnp.where(
+            mask, data.observation[seq_idx], jnp.zeros((wm_cfg.seq_len, *obs_shape))
+        )
+        # same for actions
+        act = jnp.where(
+            seq_idx >= 0, data.action[seq_idx], jnp.zeros((wm_cfg.seq_len,), dtype=int)
+        )
+
         tgt = data.next_observation[batch_idx]
         pred = model(obs, act)
 
@@ -245,6 +270,7 @@ def compute_fitness(
     # Initialize the world model and optimizer
     model = WorldModel(
         key_wm,
+        seq_len=wm_cfg.seq_len,
         hdim=wm_cfg.hdim,
         obs_dim=env_params.view_size**2,
         num_actions=env_params.num_actions,
