@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import numpy as np
 import os
+from socket import gethostname
 
 from typing import Any
 from jaxtyping import (
@@ -32,13 +33,15 @@ with install_import_hook("network", "beartype.beartype"):
 
 from eda import generate_eda_state, EdaConfig, eda_sample
 
-# persistent compilation cache
-jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-jax.config.update(
-    "jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir"
-)
+if gethostname() != "bender":  # if not running on cluster
+    # persistent compilation cache
+    jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    jax.config.update(
+        "jax_persistent_cache_enable_xla_caches",
+        "xla_gpu_per_fusion_autotune_cache_dir",
+    )
 
 
 @dataclass
