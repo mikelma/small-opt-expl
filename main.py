@@ -9,8 +9,11 @@ from small_world.environment import Environment, EnvParams, Timestep
 from flax import struct
 from functools import partial
 import optax
-from typing import Optional, Callable
+from typing import Callable
 import matplotlib.pyplot as plt
+from PIL import Image
+import numpy as np
+import os
 
 from typing import Any
 from jaxtyping import (
@@ -85,7 +88,20 @@ class Args:
     seed: int = 42
 
     wandb: bool = False
+
     wandb_project_name: str = "small-opt-expl"
+
+    save_dir: str = "images"
+    """directory where images and GIFs will be saved"""
+
+    show: bool = False
+    """plots are shown to screen if true, otherwise plots are saved to `--save-dir`"""
+
+    plot_interval: int = 1
+    """interval in which plots (e.g., loss curves) are generated"""
+
+    viz_rollout_interval: int = 10
+    """interval in which a GIF of the best agent's rollout is created"""
 
 
 @struct.dataclass
@@ -98,9 +114,9 @@ class Interaction:
 
 def generate_population(
     key: PRNGKeyArray, population_size: int, kwpolicy: Any = dict()
-):
+) -> eqx.Module:
     @eqx.filter_vmap
-    def _make_pop(key):
+    def _make_pop(key: PRNGKeyArray) -> eqx.Module:
         return RnnPolicy(key, **kwpolicy)
 
     keys = jax.random.split(key, population_size)
@@ -114,15 +130,19 @@ def convert_bfloat16(module: eqx.Module) -> eqx.Module:
 
 
 def build_rollout(
-    env: Environment, env_params: EnvParams, num_timesteps: int = 100
+    env: Environment,
+    env_params: EnvParams,
+    num_timesteps: int = 100,
+    return_timestep: bool = False,
 ) -> Callable:
     @eqx.filter_jit
-    def _rollout(key: PRNGKeyArray, policy: RnnPolicy) -> Interaction:
+    def _rollout(key: PRNGKeyArray, policy: RnnPolicy) -> Interaction | Timestep:
         def _step(
             carry: tuple[Timestep, Float[Array, "{policy.rnn.hidden_size}"]],
             key_step: PRNGKeyArray,
         ) -> tuple[
-            list[Timestep, Float[Array, "{policy.rnn.hidden_size}"]], Interaction
+            tuple[Timestep, Float[Array, "{policy.rnn.hidden_size}"]],
+            Interaction | Timestep,
         ]:
             timestep, hstate = carry
 
@@ -136,13 +156,18 @@ def build_rollout(
                 timestep,
                 actions,
             )
-            interaction = Interaction(
-                observation=observation,
-                next_observation=timestep.observations[0],
-                action=action,
-                position=timestep.state.agents_pos[0],
-            )
-            return [timestep, hstate], interaction
+
+            if not return_timestep:
+                interaction = Interaction(
+                    observation=observation,
+                    next_observation=timestep.observations[0],
+                    action=action,
+                    position=timestep.state.agents_pos[0],
+                )
+
+                return (timestep, hstate), interaction
+            else:
+                return (timestep, hstate), timestep
 
         key_reset, key_keys = jax.random.split(key)
 
@@ -151,9 +176,9 @@ def build_rollout(
         # Run a rollout of the policy and collect the interactions
         init_hstate = jnp.zeros(policy.rnn.hidden_size)
         step_keys = jax.random.split(key_keys, num_timesteps)
-        _carry, interactions = jax.lax.scan(_step, [timestep, init_hstate], step_keys)
+        _carry, out = jax.lax.scan(_step, (timestep, init_hstate), step_keys)
 
-        return interactions
+        return out
 
     return _rollout
 
@@ -353,6 +378,39 @@ def plot_eval_losses(losses, fitness, fig, ax, ymax, cmap="viridis_r"):
     ax.set_ylim(0, ymax)
 
 
+def visualize_rollout(
+    key: PRNGKeyArray,
+    population: eqx.Module,
+    id: int,
+    env: Environment,
+    env_params: EnvParams,
+    num_timesteps: int = 100,
+    file_name: str = "frames.gif",
+):
+    rollout_fn = jax.jit(
+        build_rollout(env, env_params, num_timesteps, return_timestep=True)
+    )
+
+    params, _static = eqx.partition(population, eqx.is_array)
+    policy = jax.tree_util.tree_map(lambda x: x[id], params)
+
+    timesteps = rollout_fn(key, policy)
+
+    # frames is a (num_timesteps, H, W) tensor with grayscale images of the rollout
+    frames = jax.vmap(env.render, in_axes=(None, 0))(env_params, timesteps)
+
+    # normalize between 0 and 1
+    frames = (frames + 1) / 2
+    # frames to cpu and uint8
+    frames_np = np.array(frames)
+    frames_np = (frames_np * 255).astype(np.uint8)
+
+    imgs = [Image.fromarray(frame) for frame in frames_np]
+
+    # duration is in milliseconds (50ms = 20fps)
+    imgs[0].save(file_name, save_all=True, append_images=imgs[1:], duration=50, loop=0)
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
@@ -366,6 +424,9 @@ if __name__ == "__main__":
             config=vars(args),
             name=run_name,
         )
+
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
 
     key = jax.random.key(args.seed)
 
@@ -403,7 +464,7 @@ if __name__ == "__main__":
     ymax = None
 
     for it in range(args.eda.num_generations):
-        key, key_eval, key_eda = jax.random.split(key, num=3)
+        key, key_eval, key_eda, key_viz = jax.random.split(key, num=4)
 
         batched_losses, _interactions = compute_fitness_repetitions(
             key=key_eval,
@@ -414,6 +475,7 @@ if __name__ == "__main__":
             wm_cfg=args.wm,
         )
         fitness = batched_losses.sum(-1).mean(0)
+        ranking = jnp.argsort(fitness)
 
         print(
             f"{it + 1}/{args.eda.num_generations} fitness:",
@@ -423,6 +485,7 @@ if __name__ == "__main__":
             ", max:",
             fitness.max(),
         )
+
         if args.wandb:
             wandb.log(
                 {
@@ -433,14 +496,29 @@ if __name__ == "__main__":
                 step=it,
             )
 
-        ymax = batched_losses.max() if ymax is None else ymax
-        plt.cla()
-        plot_eval_losses(batched_losses, fitness, fig, ax, ymax)
-        # plt.savefig(f"videos/losses_{it + 1}.png")
-        plt.pause(1e-7)
+        if (it + 1) % args.plot_interval == 0 or (it + 1) == args.eda.num_generations:
+            ymax = batched_losses.max() if ymax is None else ymax
+            plt.cla()
+            plot_eval_losses(batched_losses, fitness, fig, ax, ymax)
+            if args.show:
+                plt.pause(1e-7)
+            else:
+                plt.savefig(f"{args.save_dir}/losses_{it + 1}.png")
+
+        if (it + 1) % args.viz_rollout_interval == 0 or (
+            it + 1
+        ) == args.eda.num_generations:
+            visualize_rollout(
+                key=key_viz,
+                population=population,
+                id=int(ranking[0]),
+                env=env,
+                env_params=env_params,
+                num_timesteps=args.env.num_timesteps,
+                file_name=f"{args.save_dir}/frames_{it + 1}.gif",
+            )
 
         # Generate new solutions
-        ranking = jnp.argsort(fitness)
         eda_state, population = eda_sample(
             key_eda,
             eda_state,
