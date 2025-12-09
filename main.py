@@ -221,7 +221,8 @@ def random_batch_indices(
 def compute_fitness(
     key: PRNGKeyArray,
     env_params: EnvParams,
-    interactions: Interaction,
+    train_data: Interaction,
+    eval_data: Interaction,
     wm_cfg: WorldModelConfig,
 ):
     @partial(jax.vmap, in_axes=(None, None, 0))
@@ -255,9 +256,7 @@ def compute_fitness(
     def _train_batch(carry, batch_idx):
         model, optim_state = carry
 
-        loss, grads = eqx.filter_value_and_grad(_avg_loss)(
-            model, interactions, batch_idx
-        )
+        loss, grads = eqx.filter_value_and_grad(_avg_loss)(model, train_data, batch_idx)
 
         updates, opt_state = optim.update(
             grads, optim_state, eqx.filter(model, eqx.is_array)
@@ -277,14 +276,17 @@ def compute_fitness(
         )
         model, optim_state = train_out
 
-        eval_loss = losses.mean()  # TODO eval the model in the test data here
-        print("\n*** EVAL IN TRAIN DATA ***\n")
-
-        # key, key_batch = jax.random.split(key)
-        # eval_idx = random_batch_indices(
-        #     key_batch, wm_cfg.eval_batch_size, 1, eval_dataset.action.shape[0]
-        # )[0]
-        # eval_loss = _avg_loss(model, eval_dataset, eval_idx)
+        # evaluate the current world model in the eval data
+        key, key_batch = jax.random.split(key)
+        len_data = eval_data.action.shape[0]
+        eval_batch_idx = random_batch_indices(
+            key=key_batch,
+            batch_size=wm_cfg.eval_batch_size,
+            num_batches=1,
+            dataset_len=len_data,
+            sequential=False,
+        )[0]
+        eval_loss = _avg_loss(model, eval_data, eval_batch_idx)
 
         carry = (model, optim_state, key)
 
@@ -304,7 +306,7 @@ def compute_fitness(
     optim_state = optim.init(eqx.filter(model, eqx.is_array))
 
     # Pre-compute training batch indices. shape: (iters, num_batches, batch_size)
-    dataset_len = interactions.observation.shape[0]
+    dataset_len = train_data.observation.shape[0]
     batches = random_batch_indices(
         key_batches,
         wm_cfg.batch_size * wm_cfg.num_batches,
@@ -338,23 +340,51 @@ def compute_fitness_repetitions(
     ],
     Interaction,
 ]:
-    def one_population_eval(key: PRNGKeyArray):
-        key_roll, key_fs = jax.random.split(key)
+    def _population_rollout(key: PRNGKeyArray) -> Interaction:
+        @jax.vmap
+        def _repeat_rollouts(key: PRNGKeyArray) -> Interaction:
+            keys = jax.random.split(key, population_size)
+            interactions = eqx.filter_vmap(rollout_fn)(keys, population)
+            return interactions
 
-        # generate a rollout for each policy in the population
-        keys_rolls = jax.random.split(key_roll, population_size)
-        interactions = eqx.filter_vmap(rollout_fn)(keys_rolls, population)
+        keys_repes = jax.random.split(key, num_repetitions)
+        interactions = _repeat_rollouts(keys_repes)
+        return interactions
 
-        # evaluate the population based on the collected iterations
-        keys_fs = jax.random.split(key_fs, population_size)
-        batched_compute_fs = jax.vmap(compute_fitness, in_axes=(0, None, 0, None))
-        fitnesses = batched_compute_fs(keys_fs, env_params, interactions, wm_cfg)
-        return fitnesses, interactions
+    def _repeated_population_eval(
+        key: PRNGKeyArray, interactions: Interaction
+    ) -> Float[Array, "{num_repetitions} {population_size} {wm_cfg.num_iterations}"]:
+        # flatten the `num_repetitions`, `population_size`, and
+        # `args.env.num_timesteps` (first three dims of each array in `interactions`)
+        eval_data = jax.tree_util.tree_map(
+            lambda x: x.reshape(-1, *x.shape[3:]), interactions
+        )
 
-    repeated_population_eval = eqx.filter_vmap(one_population_eval)
+        @jax.vmap
+        def _population_eval(
+            key: PRNGKeyArray, interactions: Interaction
+        ) -> Float[Array, "{population_size} {wm_cfg.num_iterations}"]:
+            # evaluate the population based on the collected iterations
+            keys_fs = jax.random.split(key, population_size)
+            batched_compute_fs = jax.vmap(
+                compute_fitness, in_axes=(0, None, 0, None, None)
+            )
+            fitnesses = batched_compute_fs(
+                keys_fs,
+                env_params,
+                interactions,
+                eval_data,
+                wm_cfg,
+            )
+            return fitnesses
 
-    keys = jax.random.split(key, num_repetitions)
-    many_fs, many_interactions = repeated_population_eval(keys)
+        keys = jax.random.split(key, num_repetitions)
+        fs = _population_eval(keys, interactions)
+        return fs
+
+    key_roll, key_fs = jax.random.split(key)
+    many_interactions = _population_rollout(key_roll)
+    many_fs = _repeated_population_eval(key_fs, many_interactions)
     return many_fs, many_interactions
 
 
