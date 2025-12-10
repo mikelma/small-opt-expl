@@ -1282,7 +1282,7 @@ wheels = [
 [[package]]
 name = "small-world"
 version = "0.1.0"
-source = { git = "https://github.com/mikelma/small-world.git?branch=main#c15353ee6f97700b7382e38868fcab2b637a86de" }
+source = { git = "https://github.com/mikelma/small-world.git?branch=main#fe598d36099a34112843e175fc268ded1f0bff63" }
 dependencies = [
     { name = "beartype" },
     { name = "catppuccin" },
