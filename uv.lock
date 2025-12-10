@@ -45,6 +45,15 @@ wheels = [
 ]
 
 [[package]]
+name = "catppuccin"
+version = "2.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b6/31/87c3ca25d29678e076e1f0d151ef8792f0557b26a8dc865035b5f1fa96c4/catppuccin-2.5.0.tar.gz", hash = "sha256:3035f3bf35bc2369d1cb4c754272a494708592a1e62d42655a371863ac7c6834", size = 1918017, upload-time = "2025-08-03T20:06:40.089Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c8/9c/7908f34009eec72884fe9448a62188423a3621f04ee58e2abaec379c9cc0/catppuccin-2.5.0-py3-none-any.whl", hash = "sha256:74a1f1db79d527905225f1afce1c8858d06e2dd1231e4300a72a812797cdb572", size = 19600, upload-time = "2025-08-03T20:06:38.912Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2025.11.12"
 source = { registry = "https://pypi.org/simple" }
@@ -1221,7 +1230,7 @@ requires-dist = [
     { name = "jaxtyping", specifier = ">=0.3.3" },
     { name = "matplotlib", specifier = ">=3.10.7" },
     { name = "pillow", specifier = ">=12.0.0" },
-    { name = "small-world", git = "https://github.com/mikelma/small-world.git" },
+    { name = "small-world", git = "https://github.com/mikelma/small-world.git?branch=main" },
     { name = "tyro", specifier = ">=0.9.35" },
     { name = "wandb", specifier = ">=0.23.1" },
 ]
@@ -1273,9 +1282,10 @@ wheels = [
 [[package]]
 name = "small-world"
 version = "0.1.0"
-source = { git = "https://github.com/mikelma/small-world.git#99d67cb03ed481d772ed108b771143cfa0fe8b17" }
+source = { git = "https://github.com/mikelma/small-world.git?branch=main#c15353ee6f97700b7382e38868fcab2b637a86de" }
 dependencies = [
     { name = "beartype" },
+    { name = "catppuccin" },
     { name = "flax" },
     { name = "jax" },
     { name = "jaxtyping" },

@@ -17,4 +17,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-small-world = { git = "https://github.com/mikelma/small-world.git" }
+small-world = { git = "https://github.com/mikelma/small-world.git", branch = "main" }
