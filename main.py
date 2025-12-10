@@ -427,16 +427,10 @@ def visualize_rollout(
 
     timesteps = rollout_fn(key, policy)
 
-    # frames is a (num_timesteps, H, W) tensor with grayscale images of the rollout
-    frames = jax.vmap(env.render, in_axes=(None, 0))(env_params, timesteps)
+    frames = jax.vmap(env.render, in_axes=(None, 0, None))(env_params, timesteps, 20)
+    np_frames = np.array(frames).astype(np.uint8)
 
-    # normalize between 0 and 1
-    frames = (frames + 1) / 2
-    # frames to cpu and uint8
-    frames_np = np.array(frames)
-    frames_np = (frames_np * 255).astype(np.uint8)
-
-    imgs = [Image.fromarray(frame) for frame in frames_np]
+    imgs = [Image.fromarray(frame) for frame in np_frames]
 
     # duration is in milliseconds (50ms = 20fps)
     imgs[0].save(file_name, save_all=True, append_images=imgs[1:], duration=50, loop=0)
