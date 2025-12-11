@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import equinox as eqx
 from small_world.envs.from_map import FromMap
 from small_world.envs.simple import Simple
+from small_world.utils import empty_cells_mask
 from small_world.environment import Environment, EnvParams, Timestep
 from flax import struct
 from functools import partial
@@ -22,6 +23,7 @@ from jaxtyping import (
     Integer,
     PRNGKeyArray,
     ScalarLike,
+    Scalar,
     install_import_hook,
     jaxtyped,
 )
@@ -409,6 +411,19 @@ def plot_eval_losses(losses, fitness, fig, ax, ymax, cmap="viridis_r"):
     ax.set_ylim(0, ymax)
 
 
+def number_unique_visits(
+    positions: Integer[Array, "num_inter 2"], num_interactions: int = 512
+) -> Integer[Scalar, ""]:
+    uniques_static = jnp.unique(
+        positions,
+        axis=0,
+        size=num_interactions,
+        fill_value=jnp.asarray((-1, -1)),
+    )
+    num_uniques = (uniques_static >= 0).all(axis=1).sum()
+    return num_uniques
+
+
 def visualize_rollout(
     key: PRNGKeyArray,
     population: eqx.Module,
@@ -489,10 +504,16 @@ if __name__ == "__main__":
     fig, ax = plt.subplots()
     ymax = None
 
+    # get the number of empty cells in the environment (used in metrics in the main loop below)
+    key, reset_key = jax.random.split(key)
+    dummy_timestep = env.reset(env_params, reset_key)
+    mask = empty_cells_mask(dummy_timestep.state.grid)
+    num_empty_cells = mask.sum()
+
     for it in range(args.eda.num_generations):
         key, key_eval, key_eda, key_viz = jax.random.split(key, num=4)
 
-        batched_losses, _interactions = compute_fitness_repetitions(
+        batched_losses, interactions = compute_fitness_repetitions(
             key=key_eval,
             env_params=env_params,
             population=population,
@@ -543,6 +564,15 @@ if __name__ == "__main__":
                 num_timesteps=args.env.num_timesteps,
                 file_name=f"{args.save_dir}/frames_{it + 1}.gif",
             )
+
+        # compute the number of unique positions that the agent with the
+        # best fitness visits (on average through repetitions)
+        positions = interactions.position[:, ranking[0], :, :]
+        batch_unique_visits = jax.vmap(number_unique_visits, in_axes=(0, None))(
+            positions, args.env.num_timesteps
+        )
+        coverage_frac = (batch_unique_visits / num_empty_cells).mean()
+        wandb.log({"best agents coverage frac": coverage_frac}, step=it)
 
         # Generate new solutions
         eda_state, population = eda_sample(
