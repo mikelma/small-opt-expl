@@ -422,8 +422,9 @@ def visualize_rollout(
         build_rollout(env, env_params, num_timesteps, return_timestep=True)
     )
 
-    params, _static = eqx.partition(population, eqx.is_array)
-    policy = jax.tree_util.tree_map(lambda x: x[id], params)
+    params, static = eqx.partition(population, eqx.is_array)
+    policy_params = jax.tree_util.tree_map(lambda x: x[id], params)
+    policy = eqx.combine(policy_params, static)
 
     timesteps = rollout_fn(key, policy)
 
