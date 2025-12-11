@@ -32,7 +32,7 @@ class RnnPolicy(eqx.Module):
 
         # apply recurrent layer
         hstate = self.rnn(x, hstate)
-
+        x = hstate
         for layer in self.layers[:-1]:
             x = jax.nn.relu(layer(x))
 
