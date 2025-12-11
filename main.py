@@ -137,6 +137,7 @@ def build_rollout(
     env_params: EnvParams,
     num_timesteps: int = 100,
     return_timestep: bool = False,
+    random_action_prob: float = 0.0,
 ) -> Callable:
     @eqx.filter_jit
     def _rollout(key: PRNGKeyArray, policy: RnnPolicy) -> Interaction | Timestep:
@@ -149,9 +150,17 @@ def build_rollout(
         ]:
             timestep, hstate = carry
 
-            key_step, key_action = jax.random.split(key_step)
+            key_step, key_action, key_p, key_pa = jax.random.split(key_step, num=4)
             observation = timestep.observations[0]
             action, hstate = policy(key_action, observation, hstate)
+
+            # take a random action with some probability
+            p = jax.random.uniform(key_p)
+            rand_act = jax.random.randint(key_pa, (), 0, env_params.num_actions)
+            action = jax.lax.cond(
+                p < random_action_prob, lambda: rand_act, lambda: action
+            )
+
             actions = jnp.expand_dims(action, axis=0)
             timestep = env.step(
                 key_step,
@@ -343,11 +352,14 @@ def compute_fitness_repetitions(
     ],
     Interaction,
 ]:
-    def _population_rollout(key: PRNGKeyArray) -> Interaction:
+    def _population_rollout(key: PRNGKeyArray, noisy: bool = False) -> Interaction:
         @jax.vmap
         def _repeat_rollouts(key: PRNGKeyArray) -> Interaction:
             keys = jax.random.split(key, population_size)
-            interactions = eqx.filter_vmap(rollout_fn)(keys, population)
+            if noisy:
+                interactions = eqx.filter_vmap(noisy_rollout_fn)(keys, population)
+            else:
+                interactions = eqx.filter_vmap(rollout_fn)(keys, population)
             return interactions
 
         keys_repes = jax.random.split(key, num_repetitions)
@@ -355,12 +367,18 @@ def compute_fitness_repetitions(
         return interactions
 
     def _repeated_population_eval(
-        key: PRNGKeyArray, interactions: Interaction
+        key: PRNGKeyArray, interactions: Interaction, noisy_interactions: Interaction
     ) -> Float[Array, "{num_repetitions} {population_size} {wm_cfg.num_iterations}"]:
         # flatten the `num_repetitions`, `population_size`, and
         # `args.env.num_timesteps` (first three dims of each array in `interactions`)
-        eval_data = jax.tree_util.tree_map(
+        data = jax.tree_util.tree_map(
             lambda x: x.reshape(-1, *x.shape[3:]), interactions
+        )
+        noisy_data = jax.tree_util.tree_map(
+            lambda x: x.reshape(-1, *x.shape[3:]), noisy_interactions
+        )
+        eval_data = jax.tree.map(
+            lambda a, b: jnp.concatenate([a, b], axis=0), data, noisy_data
         )
 
         @jax.vmap
@@ -385,9 +403,10 @@ def compute_fitness_repetitions(
         fs = _population_eval(keys, interactions)
         return fs
 
-    key_roll, key_fs = jax.random.split(key)
-    many_interactions = _population_rollout(key_roll)
-    many_fs = _repeated_population_eval(key_fs, many_interactions)
+    key_roll1, key_roll2, key_fs = jax.random.split(key, num=3)
+    many_interactions = _population_rollout(key_roll1, noisy=False)
+    noisy_interactions = _population_rollout(key_roll2, noisy=True)
+    many_fs = _repeated_population_eval(key_fs, many_interactions, noisy_interactions)
     return many_fs, many_interactions
 
 
@@ -490,6 +509,9 @@ if __name__ == "__main__":
         population = convert_bfloat16(population)
 
     rollout_fn = build_rollout(env, env_params, num_timesteps=args.env.num_timesteps)
+    noisy_rollout_fn = build_rollout(
+        env, env_params, num_timesteps=args.env.num_timesteps, random_action_prob=0.5
+    )
 
     eda_state = generate_eda_state(population)
 
@@ -565,14 +587,15 @@ if __name__ == "__main__":
                 file_name=f"{args.save_dir}/frames_{it + 1}.gif",
             )
 
-        # compute the number of unique positions that the agent with the
-        # best fitness visits (on average through repetitions)
-        positions = interactions.position[:, ranking[0], :, :]
-        batch_unique_visits = jax.vmap(number_unique_visits, in_axes=(0, None))(
-            positions, args.env.num_timesteps
-        )
-        coverage_frac = (batch_unique_visits / num_empty_cells).mean()
-        wandb.log({"best agents coverage frac": coverage_frac}, step=it)
+        if args.wandb:
+            # compute the number of unique positions that the agent with the
+            # best fitness visits (on average through repetitions)
+            positions = interactions.position[:, ranking[0], :, :]
+            batch_unique_visits = jax.vmap(number_unique_visits, in_axes=(0, None))(
+                positions, args.env.num_timesteps
+            )
+            coverage_frac = (batch_unique_visits / num_empty_cells).mean()
+            wandb.log({"best agents coverage frac": coverage_frac}, step=it)
 
         # Generate new solutions
         eda_state, population = eda_sample(
