@@ -565,14 +565,15 @@ if __name__ == "__main__":
                 file_name=f"{args.save_dir}/frames_{it + 1}.gif",
             )
 
-        # compute the number of unique positions that the agent with the
-        # best fitness visits (on average through repetitions)
-        positions = interactions.position[:, ranking[0], :, :]
-        batch_unique_visits = jax.vmap(number_unique_visits, in_axes=(0, None))(
-            positions, args.env.num_timesteps
-        )
-        coverage_frac = (batch_unique_visits / num_empty_cells).mean()
-        wandb.log({"best agents coverage frac": coverage_frac}, step=it)
+        if args.wandb:
+            # compute the number of unique positions that the agent with the
+            # best fitness visits (on average through repetitions)
+            positions = interactions.position[:, ranking[0], :, :]
+            batch_unique_visits = jax.vmap(number_unique_visits, in_axes=(0, None))(
+                positions, args.env.num_timesteps
+            )
+            coverage_frac = (batch_unique_visits / num_empty_cells).mean()
+            wandb.log({"best agents coverage frac": coverage_frac}, step=it)
 
         # Generate new solutions
         eda_state, population = eda_sample(
