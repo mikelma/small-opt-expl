@@ -16,7 +16,7 @@ from PIL import Image
 import numpy as np
 import os
 
-from typing import Any
+from typing import Any, TypeAlias
 from jaxtyping import (
     Float,
     Array,
@@ -42,6 +42,9 @@ jax.config.update(
     "jax_persistent_cache_enable_xla_caches",
     "xla_gpu_per_fusion_autotune_cache_dir",
 )
+
+
+OptimState: TypeAlias = Any
 
 
 @dataclass
@@ -177,7 +180,7 @@ def build_rollout(
         timestep = env.reset(env_params, key_reset)
 
         # Run a rollout of the policy and collect the interactions
-        init_hstate = jnp.zeros(policy.rnn.hidden_size)
+        init_hstate = jnp.zeros(policy.rnn.hidden_size)  # type: ignore[unresolved-attribute]
         step_keys = jax.random.split(key_keys, num_timesteps)
         _carry, out = jax.lax.scan(_step, (timestep, init_hstate), step_keys)
 
@@ -229,9 +232,11 @@ def compute_fitness(
     wm_cfg: WorldModelConfig,
 ):
     @partial(jax.vmap, in_axes=(None, None, 0))
-    def _batched_loss_fn(model, data, batch_idx):
+    def _batched_loss_fn(
+        model: eqx.Module, data: Interaction, batch_idx: Integer[Scalar, ""]
+    ) -> Float[Array, "view_size view_size"]:
         # take the last M number of observations starting from `batch_idx`.
-        seq_idx = batch_idx - jnp.arange(wm_cfg.seq_len)[::-1]
+        seq_idx = batch_idx - jnp.arange(wm_cfg.seq_len, dtype=int)[::-1]
         # if `batch_idx` is lower than wm.seq_len then (i.e., there're no
         # prev steps), fill the missing obs and acts with zeros.
         obs_shape = data.observation.shape[1:]
@@ -243,20 +248,25 @@ def compute_fitness(
         )
         # same for actions
         act = jnp.where(
-            seq_idx >= 0, data.action[seq_idx], jnp.zeros((wm_cfg.seq_len,), dtype=int)
+            seq_idx >= 0,
+            data.action[seq_idx],  # type: ignore[non-subscriptable]
+            jnp.zeros((wm_cfg.seq_len,), dtype=int),
         )
-
         tgt = data.next_observation[batch_idx]
-        pred = model(obs, act)
+        pred = model(obs, act)  # type: ignore[non-callable]
 
         loss = optax.losses.squared_error(pred, tgt)
-        return loss
+        return jnp.array(loss)  # fixes type checker error
 
-    def _avg_loss(model, data, batch_idx):
+    def _avg_loss(
+        model: eqx.Module, data: Interaction, batch_idx: Integer[Array, "batch_size"]
+    ) -> Scalar:
         losses = _batched_loss_fn(model, data, batch_idx)
         return losses.mean()
 
-    def _train_batch(carry, batch_idx):
+    def _train_batch(
+        carry: tuple[eqx.Module, OptimState], batch_idx: Integer[Array, "batch_size"]
+    ) -> tuple[tuple[eqx.Module, OptimState], Scalar]:
         model, optim_state = carry
 
         loss, grads = eqx.filter_value_and_grad(_avg_loss)(model, train_data, batch_idx)
@@ -270,7 +280,10 @@ def compute_fitness(
         new_carry = (model, optim_state)
         return new_carry, loss
 
-    def _train_eval_step(carry, batch_indices):
+    def _train_eval_step(
+        carry: tuple[eqx.Module, OptimState, PRNGKeyArray],
+        batch_indices: Integer[Array, "num_batches batch_size"],
+    ) -> tuple[tuple[eqx.Module, OptimState, PRNGKeyArray], Scalar]:
         model, optim_state, key = carry
 
         # Scan across num_batches. `batch_indices` shape: (num_batches, batch_size).
@@ -281,7 +294,7 @@ def compute_fitness(
 
         # evaluate the current world model in the eval data
         key, key_batch = jax.random.split(key)
-        len_data = eval_data.action.shape[0]
+        len_data = eval_data.action.shape[0]  # type: ignore[possibly-missing-attribute]
         eval_batch_idx = random_batch_indices(
             key=key_batch,
             batch_size=wm_cfg.eval_batch_size,
