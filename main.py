@@ -273,10 +273,12 @@ def compute_fitness(
         eval_batch_idx = jax.random.randint(
             key_batch, (wm_cfg.eval_batch_size,), 0, len_data
         )
+        eval_obs = eval_data.observation[eval_batch_idx]
+        eval_act = eval_data.action[eval_batch_idx]
+        eval_tgt = eval_data.next_observation[eval_batch_idx][:, -1, :, :]
+        pred = jax.vmap(model.__call__)(eval_obs, eval_act)  # type: ignore[non-callable]
 
-        # use the full eval batch for evaluation
-        eval_mask = jnp.ones(wm_cfg.eval_batch_size, dtype=bool)
-        eval_loss = _avg_loss(model, eval_data, eval_batch_idx, eval_mask)
+        eval_loss = optax.losses.squared_error(pred, eval_tgt).mean()
 
         carry = (model, optim_state, key)
 
@@ -304,7 +306,61 @@ def compute_fitness(
     return eval_losses
 
 
-@eqx.filter_jit
+def generate_eval_set(data: Interaction) -> Interaction:
+    @jax.jit
+    def _to_sequences(data, seq_len=8):
+        """
+        Converts [R, A, T, ...] -> [R, A, Num_Seqs, seq_len, ...]
+        """
+
+        def _make_windows(arr):
+            num_timesteps = arr.shape[2]
+
+            # pad the start of axis 2
+            pad_config = [(0, 0)] * arr.ndim
+            pad_config[2] = (seq_len - 1, 0)
+            arr = jnp.pad(arr, pad_config, mode="constant", constant_values=0)
+
+            # generate start indices
+            starts = jnp.arange(num_timesteps)
+
+            # vmap over starts to slice windows efficiently
+            # shape: [num_seqs, R, A, seq_len, ...]
+            windows = jax.vmap(
+                lambda i: jax.lax.dynamic_slice_in_dim(arr, i, seq_len, axis=2)
+            )(starts)
+
+            # move num_seqs to axis 2
+            return jnp.moveaxis(windows, 0, 2)
+
+        return jax.tree_util.tree_map(_make_windows, data)
+
+    @jax.jit
+    def _uniques_mask(data: Interaction):
+        shape = data.observation.shape
+        flat_obs = data.observation.reshape(*shape[:-3], -1)
+
+        # TODO we're considering unique sequences those of unique observations.
+        # Should we consider actions too? stacking actions to flat_obs?
+
+        uniques = jnp.unique(flat_obs, size=flat_obs.shape[0], fill_value=-2.0, axis=0)
+        uniques_mask = (uniques != -2.0).all(axis=1)
+        return uniques_mask
+
+    # create sequences of `seq_len` interactions using a sliding window
+    seq_data = _to_sequences(data)
+
+    # flatten the `num_repetitions`, `population_size`, and
+    # `args.env.num_timesteps` (first three dims of each array in `interactions`)
+    seq_data = jax.tree_util.tree_map(lambda x: x.reshape(-1, *x.shape[3:]), seq_data)
+
+    mask = _uniques_mask(seq_data)
+
+    eval_data = jax.tree_util.tree_map(lambda x: x[mask], seq_data)
+    return eval_data
+
+
+# @eqx.filter_jit
 @jaxtyped(typechecker=typechecker)
 def compute_fitness_repetitions(
     key: PRNGKeyArray,
@@ -320,6 +376,7 @@ def compute_fitness_repetitions(
     ],
     Interaction,
 ]:
+    @eqx.filter_jit
     def _population_rollout(key: PRNGKeyArray) -> Interaction:
         @jax.vmap
         def _repeat_rollouts(key: PRNGKeyArray) -> Interaction:
@@ -331,15 +388,12 @@ def compute_fitness_repetitions(
         interactions = _repeat_rollouts(keys_repes)
         return interactions
 
+    @eqx.filter_jit
     def _repeated_population_eval(
-        key: PRNGKeyArray, interactions: Interaction
+        key: PRNGKeyArray,
+        interactions: Interaction,
+        eval_data: Interaction,
     ) -> Float[Array, "{num_repetitions} {population_size} {wm_cfg.num_iterations}"]:
-        # flatten the `num_repetitions`, `population_size`, and
-        # `args.env.num_timesteps` (first three dims of each array in `interactions`)
-        eval_data = jax.tree_util.tree_map(
-            lambda x: x.reshape(-1, *x.shape[3:]), interactions
-        )
-
         @jax.vmap
         def _population_eval(
             key: PRNGKeyArray, interactions: Interaction
@@ -363,9 +417,12 @@ def compute_fitness_repetitions(
         return fs
 
     key_roll, key_fs = jax.random.split(key)
-    many_interactions = _population_rollout(key_roll)
-    many_fs = _repeated_population_eval(key_fs, many_interactions)
-    return many_fs, many_interactions
+    train_data = _population_rollout(key_roll)
+
+    eval_data = generate_eval_set(train_data)
+
+    many_fs = _repeated_population_eval(key_fs, train_data, eval_data)
+    return many_fs, train_data
 
 
 def plot_eval_losses(losses, fitness, fig, ax, ymax, cmap="viridis_r"):
