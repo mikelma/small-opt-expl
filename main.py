@@ -389,8 +389,9 @@ def plot_eval_losses(losses, fitness, fig, ax, ymax, cmap="viridis_r"):
 
 
 def number_unique_visits(
-    positions: Integer[Array, "num_inter 2"], num_interactions: int = 512
+    positions: Integer[Array, "num_interactions 2"],
 ) -> Integer[Scalar, ""]:
+    num_interactions = positions.shape[0]
     uniques_static = jnp.unique(
         positions,
         axis=0,
@@ -399,6 +400,19 @@ def number_unique_visits(
     )
     num_uniques = (uniques_static >= 0).all(axis=1).sum()
     return num_uniques
+
+
+def visit_matrix(
+    positions: Integer[Array, "num_interactions 2"], env_params: EnvParams
+) -> Integer[Array, "{env_params.height} {env_params.width}"]:
+    def _count(m, position):
+        i, j = position[0], position[1]
+        m = m.at[i, j].set(m[i, j] + 1)
+        return m, 0
+
+    mat = jnp.zeros((env_params.height, env_params.width), dtype=int)
+    m, _ = jax.lax.scan(_count, mat, positions)
+    return m
 
 
 def visualize_rollout(
@@ -478,8 +492,10 @@ if __name__ == "__main__":
         param_count // args.eda.population_size,
     )
 
-    fig, ax = plt.subplots()
+    fig1, ax1 = plt.subplots()
     ymax = None
+
+    fig2, ax2 = plt.subplots()
 
     # get the number of empty cells in the environment (used in metrics in the main loop below)
     key, reset_key = jax.random.split(key)
@@ -520,14 +536,36 @@ if __name__ == "__main__":
                 step=it,
             )
 
+        # the positions in which the best agent has been
+        # dims: (num_repes, num_interactions, 2)
+        positions = interactions.position[:, ranking[0], :, :]
+
+        if args.wandb:
+            # compute the number of unique positions that the agent with the
+            # best fitness visits (on average through repetitions)
+            batch_unique_visits = jax.vmap(number_unique_visits)(positions)
+            coverage_frac = (batch_unique_visits / num_empty_cells).mean()
+            wandb.log({"best agents coverage frac": coverage_frac}, step=it)
+
+        # --- plots --- #
         if (it + 1) % args.plot_interval == 0 or (it + 1) == args.eda.num_generations:
             ymax = batched_losses.max() if ymax is None else ymax
-            plt.cla()
-            plot_eval_losses(batched_losses, fitness, fig, ax, ymax)
+            ax1.cla()
+            plot_eval_losses(batched_losses, fitness, fig1, ax1, ymax)
+
+            ax2.cla()
+            visit_mat = jax.vmap(visit_matrix, in_axes=(0, None))(positions, env_params)
+            ax2.set_title("Best agent's average visits per cell")
+            ax2.imshow(visit_mat.mean(0))  # average across repetitions
+
             if args.show:
+                fig1.canvas.draw()
+                fig2.canvas.draw()
                 plt.pause(1e-7)
+
             else:
-                plt.savefig(f"{args.save_dir}/losses_{it + 1}.png")
+                fig1.savefig(f"{args.save_dir}/losses_{it + 1}.png")
+                fig2.savefig(f"{args.save_dir}/visits_{it + 1}.png")
 
         if (it + 1) % args.viz_rollout_interval == 0 or (
             it + 1
@@ -541,16 +579,6 @@ if __name__ == "__main__":
                 num_timesteps=args.env.num_timesteps,
                 file_name=f"{args.save_dir}/frames_{it + 1}.gif",
             )
-
-        if args.wandb:
-            # compute the number of unique positions that the agent with the
-            # best fitness visits (on average through repetitions)
-            positions = interactions.position[:, ranking[0], :, :]
-            batch_unique_visits = jax.vmap(number_unique_visits, in_axes=(0, None))(
-                positions, args.env.num_timesteps
-            )
-            coverage_frac = (batch_unique_visits / num_empty_cells).mean()
-            wandb.log({"best agents coverage frac": coverage_frac}, step=it)
 
         # Generate new solutions
         eda_state, population = eda_sample(
