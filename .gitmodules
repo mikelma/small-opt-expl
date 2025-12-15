@@ -1,0 +1,3 @@
+[submodule "small-world"]
+	path = small-world
+	url = https://github.com/mikelma/small-world

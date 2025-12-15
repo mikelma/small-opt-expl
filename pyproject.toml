@@ -16,5 +16,10 @@ dependencies = [
     "wandb>=0.23.1",
 ]
 
+[tool.uv.workspace]
+members = [
+    "small-world",
+]
+
 [tool.uv.sources]
-small-world = { git = "https://github.com/mikelma/small-world.git", branch = "main" }
+small-world = { workspace = true }
