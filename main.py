@@ -24,6 +24,7 @@ from jaxtyping import (
     PRNGKeyArray,
     ScalarLike,
     Scalar,
+    Bool,
     install_import_hook,
     jaxtyped,
 )
@@ -72,7 +73,7 @@ class WorldModelConfig(eqx.Module):
     num_batches: int = 4
     """number of batches to train at each train iteration"""
 
-    num_iterations: int = 20
+    num_iterations: int = 32
     """number of total updates in training"""
 
     eval_batch_size: int = 128
@@ -189,39 +190,6 @@ def build_rollout(
     return _rollout
 
 
-@jaxtyped(typechecker=typechecker)
-def random_batch_indices(
-    key: PRNGKeyArray,
-    batch_size: int,
-    num_batches: int,
-    dataset_len: int,
-    sequential: bool = True,
-) -> Integer[Array, "{num_batches} {batch_size}"]:
-    """Example output for batch_size=8, num_bathes=3, dataset_len: 100, and sequential=True:
-        [[10  5  4  4 10 25  1  7]  # indices in [0, 33)
-         [26 28 46 21 23 33 64 58]  # indices in [0, 66)
-         [30 76 59 20 18 54 57 79]] # indices in [0, 99)
-
-    Example output for the same arguments except sequential=False:
-        [[91 61 47 17 86 24 37 97]
-         [22 22 96 35 51 87 12 70]
-         [59 34 63 55 36 62 65 34]].
-    """
-
-    def batch_idx(batch_key, batch_id):
-        upper = jax.lax.select(
-            sequential,
-            on_true=(batch_id + 1) * (dataset_len // num_batches),
-            on_false=dataset_len,
-        )
-
-        return jax.random.randint(batch_key, (batch_size,), 0, upper)
-
-    keys = jax.random.split(key, num_batches)
-    batch_ids = jnp.arange(num_batches)
-    return jax.vmap(batch_idx)(keys, batch_ids)
-
-
 @eqx.filter_jit
 @jaxtyped(typechecker=typechecker)
 def compute_fitness(
@@ -231,10 +199,19 @@ def compute_fitness(
     eval_data: Interaction,
     wm_cfg: WorldModelConfig,
 ):
+    # number of timesteps of a policy rollout
+    num_policy_timesteps = train_data.observation.shape[0]
+    # compute the world model's training batch size
+    assert num_policy_timesteps % wm_cfg.num_iterations == 0, (
+        "Number of policy timesteps must be divisible by the number of world model train steps"
+    )
+    batch_size = num_policy_timesteps // wm_cfg.num_iterations
+
     @partial(jax.vmap, in_axes=(None, None, 0))
+    @jaxtyped(typechecker=typechecker)
     def _batched_loss_fn(
         model: eqx.Module, data: Interaction, batch_idx: Integer[Scalar, ""]
-    ) -> Float[Array, "view_size view_size"]:
+    ) -> Scalar:
         # take the last M number of observations starting from `batch_idx`.
         seq_idx = batch_idx - jnp.arange(wm_cfg.seq_len, dtype=int)[::-1]
         # if `batch_idx` is lower than wm.seq_len then (i.e., there're no
@@ -256,53 +233,50 @@ def compute_fitness(
         pred = model(obs, act)  # type: ignore[non-callable]
 
         loss = optax.losses.squared_error(pred, tgt)
-        return jnp.array(loss)  # fixes type checker error
+        return jnp.array(loss).mean()
 
+    @jaxtyped(typechecker=typechecker)
     def _avg_loss(
-        model: eqx.Module, data: Interaction, batch_idx: Integer[Array, "batch_size"]
+        model: eqx.Module,
+        data: Interaction,
+        batch_idx: Integer[Array, "total_steps"],
+        mask: Bool[Array, "total_steps"],
     ) -> Scalar:
         losses = _batched_loss_fn(model, data, batch_idx)
-        return losses.mean()
+        losses = (losses * mask).sum() / mask.sum()
+        return losses
 
-    def _train_batch(
-        carry: tuple[eqx.Module, OptimState], batch_idx: Integer[Array, "batch_size"]
-    ) -> tuple[tuple[eqx.Module, OptimState], Scalar]:
-        model, optim_state = carry
-
-        loss, grads = eqx.filter_value_and_grad(_avg_loss)(model, train_data, batch_idx)
-
-        updates, opt_state = optim.update(
-            grads, optim_state, eqx.filter(model, eqx.is_array)
-        )
-
-        model = eqx.apply_updates(model, updates)
-
-        new_carry = (model, optim_state)
-        return new_carry, loss
-
+    @jaxtyped(typechecker=typechecker)
     def _train_eval_step(
         carry: tuple[eqx.Module, OptimState, PRNGKeyArray],
-        batch_indices: Integer[Array, "num_batches batch_size"],
+        batch_start_idx: Integer[Array, ""],
     ) -> tuple[tuple[eqx.Module, OptimState, PRNGKeyArray], Scalar]:
         model, optim_state, key = carry
 
-        # Scan across num_batches. `batch_indices` shape: (num_batches, batch_size).
-        train_out, losses = jax.lax.scan(
-            _train_batch, (model, optim_state), batch_indices
+        # full batch training with the data until timestep number batch_start_idx.
+        # generate the mask of valid training instances according to batch_start_idx
+        all_indices = jnp.arange(num_policy_timesteps)
+        valid_limit = batch_start_idx + batch_size
+        mask = all_indices < valid_limit
+
+        loss, grads = eqx.filter_value_and_grad(_avg_loss)(
+            model, train_data, all_indices, mask
         )
-        model, optim_state = train_out
+        updates, optim_state = optim.update(
+            grads, optim_state, eqx.filter(model, eqx.is_array)
+        )
+        model = eqx.apply_updates(model, updates)
 
         # evaluate the current world model in the eval data
         key, key_batch = jax.random.split(key)
         len_data = eval_data.action.shape[0]  # type: ignore[possibly-missing-attribute]
-        eval_batch_idx = random_batch_indices(
-            key=key_batch,
-            batch_size=wm_cfg.eval_batch_size,
-            num_batches=1,
-            dataset_len=len_data,
-            sequential=False,
-        )[0]
-        eval_loss = _avg_loss(model, eval_data, eval_batch_idx)
+        eval_batch_idx = jax.random.randint(
+            key_batch, (wm_cfg.eval_batch_size,), 0, len_data
+        )
+
+        # use the full eval batch for evaluation
+        eval_mask = jnp.ones(wm_cfg.eval_batch_size, dtype=bool)
+        eval_loss = _avg_loss(model, eval_data, eval_batch_idx, eval_mask)
 
         carry = (model, optim_state, key)
 
@@ -321,21 +295,11 @@ def compute_fitness(
     optim = optax.adamw(wm_cfg.learning_rate)
     optim_state = optim.init(eqx.filter(model, eqx.is_array))
 
-    # Pre-compute training batch indices. shape: (iters, num_batches, batch_size)
-    dataset_len = train_data.observation.shape[0]
-    batches = random_batch_indices(
-        key_batches,
-        wm_cfg.batch_size * wm_cfg.num_batches,
-        wm_cfg.num_iterations,
-        dataset_len,
-    )
-    batches = batches.reshape(
-        wm_cfg.num_iterations, wm_cfg.num_batches, wm_cfg.batch_size
-    )
+    batch_start_idx = jnp.arange(0, num_policy_timesteps, step=batch_size)
 
     # Run the world model train-eval loop
     carry = (model, optim_state, key_eval)
-    _carry, eval_losses = jax.lax.scan(_train_eval_step, carry, batches)
+    _carry, eval_losses = jax.lax.scan(_train_eval_step, carry, batch_start_idx)
 
     return eval_losses
 
