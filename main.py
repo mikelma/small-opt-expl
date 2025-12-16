@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import numpy as np
 import os
+from evosax.problems import Problem
 
 from typing import Any, TypeAlias
 from jaxtyping import (
@@ -32,8 +33,6 @@ from beartype import beartype as typechecker
 
 with install_import_hook("network", "beartype.beartype"):
     from network import RnnPolicy, WorldModel
-
-from eda import generate_eda_state, EdaConfig, eda_sample
 
 # persistent compilation cache
 jax.config.update("jax_compilation_cache_dir", "./jax_cache")
@@ -59,8 +58,14 @@ class PolicyConfig:
     hdim: int = 128
     """size of the hidden layers"""
 
-    f16: bool = False
-    """Use bfloat16 for the weights"""
+
+@dataclass
+class EsConfig:
+    num_generations: int = 100
+
+    population_size: int = 8
+
+    num_fs_repes: int = 4
 
 
 class WorldModelConfig(eqx.Module):
@@ -85,7 +90,7 @@ class WorldModelConfig(eqx.Module):
 @dataclass
 class Args:
     env: EnvConfig
-    eda: EdaConfig
+    es: EsConfig
     policy: PolicyConfig
     wm: WorldModelConfig
 
@@ -125,12 +130,6 @@ def generate_population(
 
     keys = jax.random.split(key, population_size)
     return _make_pop(keys)
-
-
-def convert_bfloat16(module: eqx.Module) -> eqx.Module:
-    params, static = eqx.partition(module, eqx.is_array)
-    params = jax.tree.map(lambda a: a.astype(jnp.bfloat16), params)
-    return eqx.combine(params, static)
 
 
 def build_rollout(
@@ -321,6 +320,7 @@ def compute_fitness_repetitions(
     env_params: EnvParams,
     population_size: int,
     num_repetitions: int,
+    rollout_steps: int,
     wm_cfg: WorldModelConfig,
 ) -> tuple[
     Float[
@@ -329,6 +329,8 @@ def compute_fitness_repetitions(
     ],
     Interaction,
 ]:
+    rollout_fn = build_rollout(env, env_params, num_timesteps=rollout_steps)
+
     def _population_rollout(
         key: PRNGKeyArray, rand_act_prob: float, num_repes: int
     ) -> Interaction:
@@ -393,6 +395,57 @@ def compute_fitness_repetitions(
     fitnesses = _repeated_population_eval(key_fs, train_data, eval_data)
 
     return fitnesses, train_data
+
+
+class EceProblem(Problem):
+    def __init__(self, cfg: Args, env: Environment, env_params: EnvParams):
+        self.env = env
+        self.env_params = env_params
+        self.cfg = cfg
+
+        key = jax.random.key(0)
+        kwpolicy = dict(
+            in_dim=env_params.view_size * env_params.view_size,
+            out_dim=env_params.num_actions,
+            hdim=cfg.policy.hdim,
+        )
+
+        key = jax.random.key(0)
+        population = generate_population(
+            key, population_size=cfg.es.population_size, kwpolicy=kwpolicy
+        )
+        _, self.population_static = eqx.partition(population, eqx.is_array)
+
+    @partial(jax.jit, static_argnames=("self",))
+    def sample(self, key: jax.Array):
+        """Sample a solution in the search space."""
+        kwpolicy = dict(
+            in_dim=self.env_params.view_size * self.env_params.view_size,
+            out_dim=self.env_params.num_actions,
+            hdim=self.cfg.policy.hdim,
+        )
+        solution = RnnPolicy(key, **kwpolicy)
+        params, _static = eqx.partition(solution, eqx.is_array)
+        return params
+
+    @partial(jax.jit, static_argnames=("self",))
+    def eval(self, key, solutions, state):
+        population = eqx.combine(solutions, self.population_static)
+        batched_losses, interactions = compute_fitness_repetitions(
+            key=key,
+            env_params=self.env_params,
+            population=population,
+            num_repetitions=self.cfg.es.num_fs_repes,
+            population_size=self.cfg.es.population_size,
+            wm_cfg=self.cfg.wm,
+            rollout_steps=self.cfg.env.num_timesteps,
+        )
+        fitness = batched_losses.sum(-1).mean(0)
+        return (
+            fitness,
+            state,
+            {"batched_losses": batched_losses, "interactions": interactions},
+        )
 
 
 def plot_eval_losses(losses, fitness, fig, ax, ymax, cmap="viridis_r"):
@@ -492,31 +545,23 @@ if __name__ == "__main__":
     env = FromMap()
     env_params = env.default_params(file_name=args.env.file_name)
 
-    # Generate the population
-    key, key_pop = jax.random.split(key)
-    population = generate_population(
-        key_pop,
-        args.eda.population_size,
-        kwpolicy=dict(
-            in_dim=env_params.view_size * env_params.view_size,
-            out_dim=env_params.num_actions,
-            hdim=args.policy.hdim,
-        ),
-    )
+    from evosax.algorithms import Open_ES
 
-    if args.policy.f16:
-        population = convert_bfloat16(population)
+    key, key_prob, key_sol, key_es = jax.random.split(key, 4)
+    problem = EceProblem(cfg=args, env=env, env_params=env_params)
+    problem_state = problem.init(key_prob)
 
-    rollout_fn = build_rollout(env, env_params, num_timesteps=args.env.num_timesteps)
-
-    eda_state = generate_eda_state(population)
+    solution = problem.sample(key_sol)
+    es = Open_ES(population_size=args.es.population_size, solution=solution)
+    params = es.default_params  # Use default parameters
+    state = es.init(key_es, solution, params)
 
     # Number of parameters of policy networks
-    params, _ = eqx.partition(population, eqx.is_array)
+    params, _ = eqx.partition(solution, eqx.is_array)
     param_count = sum(x.size for x in jax.tree_util.tree_leaves(params))
     print(
         "[*] Number of parameters of the policy network:",
-        param_count // args.eda.population_size,
+        param_count,
     )
 
     fig1, ax1 = plt.subplots()
@@ -530,22 +575,20 @@ if __name__ == "__main__":
     mask = empty_cells_mask(dummy_timestep.state.grid)
     num_empty_cells = mask.sum()
 
-    for it in range(args.eda.num_generations):
-        key, key_eval, key_eda, key_viz = jax.random.split(key, num=4)
+    for it in range(args.es.num_generations):
+        key, key_ask, key_eval, key_tell, key_viz = jax.random.split(key, 5)
 
-        batched_losses, interactions = compute_fitness_repetitions(
-            key=key_eval,
-            env_params=env_params,
-            population=population,
-            num_repetitions=args.eda.num_fs_repes,
-            population_size=args.eda.population_size,
-            wm_cfg=args.wm,
-        )
-        fitness = batched_losses.sum(-1).mean(0)
+        population, state = es.ask(key_ask, state, params)
+
+        # Evaluate the fitness of the population
+        fitness, problem_state, info = problem.eval(key_eval, population, problem_state)
+        batched_losses = info["batched_losses"]
+        interactions = info["interactions"]
+
         ranking = jnp.argsort(fitness)
 
         print(
-            f"{it + 1}/{args.eda.num_generations} fitness:",
+            f"{it + 1}/{args.es.num_generations} fitness:",
             fitness.mean(),
             ", min:",
             fitness.min(),
@@ -575,7 +618,7 @@ if __name__ == "__main__":
             wandb.log({"best agents coverage frac": coverage_frac}, step=it)
 
         # --- plots --- #
-        if (it + 1) % args.plot_interval == 0 or (it + 1) == args.eda.num_generations:
+        if (it + 1) % args.plot_interval == 0 or (it + 1) == args.es.num_generations:
             ymax = batched_losses.max() if ymax is None else ymax
             ax1.cla()
             plot_eval_losses(batched_losses, fitness, fig1, ax1, ymax)
@@ -596,7 +639,7 @@ if __name__ == "__main__":
 
         if (it + 1) % args.viz_rollout_interval == 0 or (
             it + 1
-        ) == args.eda.num_generations:
+        ) == args.es.num_generations:
             visualize_rollout(
                 key=key_viz,
                 population=population,
@@ -606,13 +649,3 @@ if __name__ == "__main__":
                 num_timesteps=args.env.num_timesteps,
                 file_name=f"{args.save_dir}/frames_{it + 1}.gif",
             )
-
-        # Generate new solutions
-        eda_state, population = eda_sample(
-            key_eda,
-            eda_state,
-            population,
-            ranking,
-            elite_ratio=args.eda.elite_ratio,
-            learning_rate=args.eda.learning_rate,
-        )
