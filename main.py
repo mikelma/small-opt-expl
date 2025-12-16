@@ -140,7 +140,9 @@ def build_rollout(
     return_timestep: bool = False,
 ) -> Callable:
     @eqx.filter_jit
-    def _rollout(key: PRNGKeyArray, policy: RnnPolicy) -> Interaction | Timestep:
+    def _rollout(
+        key: PRNGKeyArray, policy: RnnPolicy, rand_act_prob: float = 0.0
+    ) -> Interaction | Timestep:
         def _step(
             carry: tuple[Timestep, Float[Array, "{policy.rnn.hidden_size}"]],
             key_step: PRNGKeyArray,
@@ -150,12 +152,22 @@ def build_rollout(
         ]:
             timestep, hstate = carry
 
-            key_step, key_action = jax.random.split(key_step)
+            key_env, key_action, key_cond, key_rand = jax.random.split(key_step, num=4)
             observation = timestep.observations[0]
             action, hstate = policy(key_action, observation, hstate)
+
+            p = jax.random.uniform(key_cond)  # random value in the range [0, 1]
+            action = jax.lax.cond(
+                p <= rand_act_prob,
+                # take a random action with unif. probability
+                lambda: jax.random.randint(key_rand, (), 0, env_params.num_actions),
+                # select policy's action
+                lambda: action,
+            )
+
             actions = jnp.expand_dims(action, axis=0)
             timestep = env.step(
-                key_step,
+                key_env,
                 env_params,
                 timestep,
                 actions,
@@ -317,32 +329,30 @@ def compute_fitness_repetitions(
     ],
     Interaction,
 ]:
-    def _population_rollout(key: PRNGKeyArray) -> Interaction:
+    def _population_rollout(
+        key: PRNGKeyArray, rand_act_prob: float, num_repes: int
+    ) -> Interaction:
         @jax.vmap
         def _repeat_rollouts(key: PRNGKeyArray) -> Interaction:
             keys = jax.random.split(key, population_size)
-            interactions = eqx.filter_vmap(rollout_fn)(keys, population)
+            interactions = eqx.filter_vmap(rollout_fn, in_axes=(0, 0, None))(
+                keys, population, rand_act_prob
+            )
             return interactions
 
-        keys_repes = jax.random.split(key, num_repetitions)
+        keys_repes = jax.random.split(key, num_repes)
         interactions = _repeat_rollouts(keys_repes)
         return interactions
 
     def _repeated_population_eval(
-        key: PRNGKeyArray, train_data: Interaction
+        key: PRNGKeyArray, train_data: Interaction, eval_data: Interaction
     ) -> Float[Array, "{num_repetitions} {population_size} {wm_cfg.num_iterations}"]:
-        # flatten the `num_repetitions`, `population_size`, and
-        # `args.env.num_timesteps` (first three dims of each array in `train_data`)
-        eval_data = jax.tree_util.tree_map(
-            lambda x: x.reshape(-1, *x.shape[3:]), train_data
-        )
-
         @jax.vmap
         def _population_eval(
-            key: PRNGKeyArray, train_data: Interaction
+            key_eval: PRNGKeyArray, train_data: Interaction
         ) -> Float[Array, "{population_size} {wm_cfg.num_iterations}"]:
+            keys_fs = jax.random.split(key_eval, population_size)
             # evaluate the population based on the collected iterations
-            keys_fs = jax.random.split(key, population_size)
             batched_compute_fs = jax.vmap(compute_ece, in_axes=(0, None, 0, None, None))
             fitnesses = batched_compute_fs(
                 keys_fs,
@@ -357,9 +367,31 @@ def compute_fitness_repetitions(
         fs = _population_eval(keys, train_data)
         return fs
 
-    key_roll, key_fs = jax.random.split(key)
-    train_data = _population_rollout(key_roll)
-    fitnesses = _repeated_population_eval(key_fs, train_data)
+    def _generate_eval_set(
+        key: PRNGKeyArray, probs: Float[Array, "num_probs"]
+    ) -> Interaction:
+        keys = jax.random.split(key, num=probs.shape[0])
+        batched_data = eqx.filter_vmap(_population_rollout, in_axes=(0, 0, None))(
+            keys, probs, 1
+        )
+        # stack every interaction in a single dimension
+        eval_data = jax.tree_util.tree_map(
+            lambda x: x.reshape(-1, *x.shape[4:]), batched_data
+        )
+        return eval_data
+
+    key_train, key_eval, key_fs = jax.random.split(key, num=3)
+
+    train_data = _population_rollout(
+        key_train, num_repes=num_repetitions, rand_act_prob=0.0
+    )
+
+    # TODO this shouldn't be hardcoded
+    rand_probs = jnp.asarray([0.1, 0.25, 0.5, 0.75])
+    eval_data = _generate_eval_set(key_eval, rand_probs)
+
+    fitnesses = _repeated_population_eval(key_fs, train_data, eval_data)
+
     return fitnesses, train_data
 
 
