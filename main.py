@@ -545,14 +545,18 @@ if __name__ == "__main__":
     env = FromMap()
     env_params = env.default_params(file_name=args.env.file_name)
 
-    from evosax.algorithms import Open_ES
+    from evosax.algorithms import Open_ES as ES
 
     key, key_prob, key_sol, key_es = jax.random.split(key, 4)
     problem = EceProblem(cfg=args, env=env, env_params=env_params)
     problem_state = problem.init(key_prob)
 
     solution = problem.sample(key_sol)
-    es = Open_ES(population_size=args.es.population_size, solution=solution)
+    es = ES(
+        population_size=args.es.population_size,
+        solution=solution,
+        std_schedule=optax.constant_schedule(0.1),
+    )
     params = es.default_params  # Use default parameters
     state = es.init(key_es, solution, params)
 
