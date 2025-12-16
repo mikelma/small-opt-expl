@@ -67,9 +67,6 @@ class WorldModelConfig(eqx.Module):
     hdim: int = 128
     """size of the hidden layers"""
 
-    batch_size: int = 16
-    """training batch size"""
-
     num_batches: int = 4
     """number of batches to train at each train iteration"""
 
