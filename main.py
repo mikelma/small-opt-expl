@@ -189,7 +189,7 @@ def build_rollout(
 
 @eqx.filter_jit
 @jaxtyped(typechecker=typechecker)
-def compute_fitness(
+def compute_ece(
     key: PRNGKeyArray,
     env_params: EnvParams,
     train_data: Interaction,
@@ -329,40 +329,38 @@ def compute_fitness_repetitions(
         return interactions
 
     def _repeated_population_eval(
-        key: PRNGKeyArray, interactions: Interaction
+        key: PRNGKeyArray, train_data: Interaction
     ) -> Float[Array, "{num_repetitions} {population_size} {wm_cfg.num_iterations}"]:
         # flatten the `num_repetitions`, `population_size`, and
-        # `args.env.num_timesteps` (first three dims of each array in `interactions`)
+        # `args.env.num_timesteps` (first three dims of each array in `train_data`)
         eval_data = jax.tree_util.tree_map(
-            lambda x: x.reshape(-1, *x.shape[3:]), interactions
+            lambda x: x.reshape(-1, *x.shape[3:]), train_data
         )
 
         @jax.vmap
         def _population_eval(
-            key: PRNGKeyArray, interactions: Interaction
+            key: PRNGKeyArray, train_data: Interaction
         ) -> Float[Array, "{population_size} {wm_cfg.num_iterations}"]:
             # evaluate the population based on the collected iterations
             keys_fs = jax.random.split(key, population_size)
-            batched_compute_fs = jax.vmap(
-                compute_fitness, in_axes=(0, None, 0, None, None)
-            )
+            batched_compute_fs = jax.vmap(compute_ece, in_axes=(0, None, 0, None, None))
             fitnesses = batched_compute_fs(
                 keys_fs,
                 env_params,
-                interactions,
+                train_data,
                 eval_data,
                 wm_cfg,
             )
             return fitnesses
 
         keys = jax.random.split(key, num_repetitions)
-        fs = _population_eval(keys, interactions)
+        fs = _population_eval(keys, train_data)
         return fs
 
     key_roll, key_fs = jax.random.split(key)
-    many_interactions = _population_rollout(key_roll)
-    many_fs = _repeated_population_eval(key_fs, many_interactions)
-    return many_fs, many_interactions
+    train_data = _population_rollout(key_roll)
+    fitnesses = _repeated_population_eval(key_fs, train_data)
+    return fitnesses, train_data
 
 
 def plot_eval_losses(losses, fitness, fig, ax, ymax, cmap="viridis_r"):
