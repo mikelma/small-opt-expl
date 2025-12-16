@@ -67,6 +67,14 @@ class EsConfig:
 
     num_fs_repes: int = 4
 
+    std_init: float = 0.05
+
+    std_decay: float = 0.2
+
+    lr_init: float = 0.01
+
+    lr_decay: float = 0.1
+
 
 class WorldModelConfig(eqx.Module):
     hdim: int = 128
@@ -552,10 +560,21 @@ if __name__ == "__main__":
     problem_state = problem.init(key_prob)
 
     solution = problem.sample(key_sol)
+    lr_schedule = optax.exponential_decay(
+        init_value=args.es.lr_init,
+        transition_steps=args.es.num_generations,
+        decay_rate=args.es.lr_decay,
+    )
+    std_schedule = optax.exponential_decay(
+        init_value=args.es.std_init,
+        transition_steps=args.es.num_generations,
+        decay_rate=args.es.std_decay,
+    )
     es = ES(
         population_size=args.es.population_size,
         solution=solution,
-        std_schedule=optax.constant_schedule(0.1),
+        std_schedule=std_schedule,
+        optimizer=optax.adam(learning_rate=lr_schedule),
     )
     params = es.default_params  # Use default parameters
     state = es.init(key_es, solution, params)
@@ -579,15 +598,21 @@ if __name__ == "__main__":
     mask = empty_cells_mask(dummy_timestep.state.grid)
     num_empty_cells = mask.sum()
 
+    ask_fn = jax.jit(es.ask)
+    tell_fn = jax.jit(es.tell)
+    eval_fn = jax.jit(problem.eval)
+
     for it in range(args.es.num_generations):
         key, key_ask, key_eval, key_tell, key_viz = jax.random.split(key, 5)
 
-        population, state = es.ask(key_ask, state, params)
+        population, state = ask_fn(key_ask, state, params)
 
         # Evaluate the fitness of the population
-        fitness, problem_state, info = problem.eval(key_eval, population, problem_state)
+        fitness, problem_state, info = eval_fn(key_eval, population, problem_state)
         batched_losses = info["batched_losses"]
         interactions = info["interactions"]
+
+        state, metrics = tell_fn(key_tell, population, fitness, state, params)
 
         ranking = jnp.argsort(fitness)
 
