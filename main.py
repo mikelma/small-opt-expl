@@ -325,6 +325,7 @@ def compute_ece(
 def compute_fitness_repetitions(
     key: PRNGKeyArray,
     population: RnnPolicy,
+    env: Environment,
     env_params: EnvParams,
     population_size: int,
     num_repetitions: int,
@@ -441,6 +442,7 @@ class EceProblem(Problem):
         population = eqx.combine(solutions, self.population_static)
         batched_losses, interactions = compute_fitness_repetitions(
             key=key,
+            env=self.env,
             env_params=self.env_params,
             population=population,
             num_repetitions=self.cfg.es.num_fs_repes,
@@ -580,11 +582,9 @@ if __name__ == "__main__":
     state = es.init(key_es, solution, params)
 
     # Number of parameters of policy networks
-    params, _ = eqx.partition(solution, eqx.is_array)
-    param_count = sum(x.size for x in jax.tree_util.tree_leaves(params))
     print(
         "[*] Number of parameters of the policy network:",
-        param_count,
+        state.best_solution.shape[0],
     )
 
     fig1, ax1 = plt.subplots()
