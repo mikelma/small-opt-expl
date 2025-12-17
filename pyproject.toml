@@ -24,3 +24,7 @@ members = [
 
 [tool.uv.sources]
 small-world = { workspace = true }
+
+
+[tool.ruff.lint]
+ignore = ["F722"]

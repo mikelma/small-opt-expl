@@ -4,7 +4,6 @@ import tyro
 from dataclasses import dataclass
 import equinox as eqx
 from small_world.envs.from_map import FromMap
-from small_world.envs.simple import Simple
 from small_world.utils import empty_cells_mask
 from small_world.environment import Environment, EnvParams, Timestep
 from flax import struct
@@ -255,8 +254,8 @@ def compute_ece(
     def _avg_loss(
         model: eqx.Module,
         data: Interaction,
-        batch_idx: Integer[Array, "total_steps"],
-        mask: Bool[Array, "total_steps"],
+        batch_idx: Integer[Array, " total_steps"],
+        mask: Bool[Array, " total_steps"],
     ) -> Scalar:
         losses = _batched_loss_fn(model, data, batch_idx)
         losses = (losses * mask).sum() / mask.sum()
@@ -379,7 +378,7 @@ def compute_fitness_repetitions(
         return fs
 
     def _generate_eval_set(
-        key: PRNGKeyArray, probs: Float[Array, "num_probs"]
+        key: PRNGKeyArray, probs: Float[Array, " num_probs"]
     ) -> Interaction:
         keys = jax.random.split(key, num=probs.shape[0])
         batched_data = eqx.filter_vmap(_population_rollout, in_axes=(0, 0, None))(
@@ -533,9 +532,7 @@ def visualize_rollout(
     imgs[0].save(file_name, save_all=True, append_images=imgs[1:], duration=50, loop=0)
 
 
-if __name__ == "__main__":
-    args = tyro.cli(Args)
-
+def main(args: Args):
     if args.wandb:
         import wandb
         import time
@@ -678,3 +675,9 @@ if __name__ == "__main__":
                 num_timesteps=args.env.num_timesteps,
                 file_name=f"{args.save_dir}/frames_{it + 1}.gif",
             )
+
+
+if __name__ == "__main__":
+    args = tyro.cli(Args)
+
+    main(args)
