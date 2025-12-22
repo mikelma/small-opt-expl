@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import tyro
-from dataclasses import dataclass
+import dataclasses
 import equinox as eqx
 from small_world.envs.from_map import FromMap
 from small_world.utils import empty_cells_mask
@@ -47,13 +47,13 @@ jax.config.update(
 OptimState: TypeAlias = Any
 
 
-@dataclass
+@dataclasses.dataclass
 class EnvConfig:
     file_name: str = "./simple_env.txt"
     num_timesteps: int = 512
 
 
-@dataclass
+@dataclasses.dataclass
 class PolicyConfig:
     hdim: int = 128
     """size of the hidden layers"""
@@ -62,7 +62,7 @@ class PolicyConfig:
     """use bfloat16 for weights"""
 
 
-@dataclass
+@dataclasses.dataclass
 class EsConfig:
     num_generations: int = 100
 
@@ -101,7 +101,7 @@ class WorldModelConfig(eqx.Module):
     """use bfloat16 for weights"""
 
 
-@dataclass
+@dataclasses.dataclass
 class Args:
     env: EnvConfig
     es: EsConfig
@@ -113,6 +113,11 @@ class Args:
     wandb: bool = False
 
     wandb_project_name: str = "small-opt-expl"
+
+    pertub_probs: list[float] = dataclasses.field(
+        default_factory=lambda: [0.1, 0.25, 0.5, 0.75]
+    )
+    """probs. of taking a random action in each pertub. set"""
 
     save_dir: str = "images"
     """directory where images and GIFs will be saved"""
@@ -334,13 +339,13 @@ def compute_ece(
     return eval_losses
 
 
-@eqx.filter_jit
 @jaxtyped(typechecker=typechecker)
 def compute_fitness_repetitions(
     key: PRNGKeyArray,
     population: RnnPolicy,
     env: Environment,
     env_params: EnvParams,
+    pertub_probs: Float[Array, " num_pertub"],
     population_size: int,
     num_repetitions: int,
     rollout_steps: int,
@@ -411,9 +416,7 @@ def compute_fitness_repetitions(
         key_train, num_repes=num_repetitions, rand_act_prob=0.0
     )
 
-    # TODO this shouldn't be hardcoded
-    rand_probs = jnp.asarray([0.1, 0.25, 0.5, 0.75])
-    eval_data = _generate_eval_set(key_eval, rand_probs)
+    eval_data = _generate_eval_set(key_eval, pertub_probs)
 
     fitnesses = _repeated_population_eval(key_fs, train_data, eval_data)
 
@@ -425,6 +428,8 @@ class EceProblem(Problem):
         self.env = env
         self.env_params = env_params
         self.cfg = cfg
+
+        self.pertub_probs = jnp.asarray(args.pertub_probs, dtype=float)
 
         key = jax.random.key(0)
         self.kwpolicy = dict(
@@ -459,6 +464,7 @@ class EceProblem(Problem):
             key=key,
             env=self.env,
             env_params=self.env_params,
+            pertub_probs=self.pertub_probs,
             population=population,
             num_repetitions=self.cfg.es.num_fs_repes,
             population_size=self.cfg.es.population_size,
