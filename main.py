@@ -223,7 +223,6 @@ def convert_bfloat16(module: eqx.Module):
     return eqx.combine(params, static)
 
 
-@eqx.filter_jit
 @jaxtyped(typechecker=typechecker)
 def compute_ece(
     key: PRNGKeyArray,
@@ -232,6 +231,37 @@ def compute_ece(
     eval_data: Interaction,
     wm_cfg: WorldModelConfig,
 ):
+    def make_windows(
+        data: Interaction,
+    ) -> tuple[
+        Float[Array, "T seq_len view view"],
+        Float[Array, "T seq_len"],
+        Float[Array, "T view view"],
+    ]:
+        len_data = data.observation.shape[0]
+
+        pad_len = wm_cfg.seq_len - 1
+
+        # pad observations
+        obs_shape = data.observation.shape[1:]
+        zeros_obs = jnp.zeros((pad_len, *obs_shape))
+        padded_obs = jnp.concatenate([zeros_obs, data.observation], axis=0)
+
+        # pad actions
+        zeros_act = jnp.zeros((pad_len,), dtype=int)
+        padded_act = jnp.concatenate([zeros_act, data.action], axis=0)
+
+        # create rolling window indices
+        # dims: (T, seq_len) -> e.g. [[0,1,2], [1,2,3], ...]
+        start_indices = jnp.arange(len_data)
+        window_indices = start_indices[:, None] + jnp.arange(wm_cfg.seq_len)[None, :]
+
+        obs_windows = padded_obs[window_indices]
+        act_windows = padded_act[window_indices]
+        targets = data.next_observation
+
+        return obs_windows, act_windows, targets
+
     # number of timesteps of a policy rollout
     num_policy_timesteps = train_data.observation.shape[0]
     # compute the world model's training batch size
@@ -240,46 +270,33 @@ def compute_ece(
     )
     batch_size = num_policy_timesteps // wm_cfg.num_iterations
 
-    @partial(jax.vmap, in_axes=(None, None, 0))
-    @jaxtyped(typechecker=typechecker)
+    train_obs, train_acts, train_tgts = make_windows(train_data)
+    eval_obs, eval_acts, eval_tgts = make_windows(eval_data)
+
+    @partial(jax.vmap, in_axes=(None, 0, 0, 0))
     def _batched_loss_fn(
-        model: eqx.Module, data: Interaction, batch_idx: Integer[Scalar, ""]
+        model: eqx.Module,
+        obs_seq: Float[Array, "seq_len view view"],
+        act_seq: Integer[Array, " seq_len"],
+        target: Float[Array, "view view"],
     ) -> Scalar:
-        # take the last M number of observations starting from `batch_idx`.
-        seq_idx = batch_idx - jnp.arange(wm_cfg.seq_len, dtype=int)[::-1]
-        # if `batch_idx` is lower than wm.seq_len then (i.e., there're no
-        # prev steps), fill the missing obs and acts with zeros.
-        obs_shape = data.observation.shape[1:]
-        mask = jnp.broadcast_to(
-            (seq_idx >= 0)[:, None, None], (wm_cfg.seq_len, *obs_shape)
-        )
-        obs = jnp.where(
-            mask, data.observation[seq_idx], jnp.zeros((wm_cfg.seq_len, *obs_shape))
-        )
-        # same for actions
-        act = jnp.where(
-            seq_idx >= 0,
-            data.action[seq_idx],  # type: ignore[non-subscriptable]
-            jnp.zeros((wm_cfg.seq_len,), dtype=int),
-        )
-        tgt = data.next_observation[batch_idx]
-        pred = model(obs, act)  # type: ignore[non-callable]
+        pred = model(obs_seq, act_seq)  # type: ignore[non-subscriptable]
+        loss = optax.losses.squared_error(pred, target)
+        return jnp.mean(loss)
 
-        loss = optax.losses.squared_error(pred, tgt)
-        return jnp.array(loss).mean()
-
-    @jaxtyped(typechecker=typechecker)
     def _avg_loss(
         model: eqx.Module,
-        data: Interaction,
         batch_idx: Integer[Array, " total_steps"],
         mask: Bool[Array, " total_steps"],
     ) -> Scalar:
-        losses = _batched_loss_fn(model, data, batch_idx)
+        b_obs = train_obs[batch_idx]
+        b_act = train_acts[batch_idx]
+        b_tgt = train_tgts[batch_idx]
+
+        losses = _batched_loss_fn(model, b_obs, b_act, b_tgt)
         losses = (losses * mask).sum() / mask.sum()
         return losses
 
-    @jaxtyped(typechecker=typechecker)
     def _train_eval_step(
         carry: tuple[eqx.Module, OptimState, PRNGKeyArray],
         batch_start_idx: Integer[Array, ""],
@@ -292,24 +309,29 @@ def compute_ece(
         valid_limit = batch_start_idx + batch_size
         mask = all_indices < valid_limit
 
-        loss, grads = eqx.filter_value_and_grad(_avg_loss)(
-            model, train_data, all_indices, mask
-        )
+        # training
+        loss, grads = eqx.filter_value_and_grad(_avg_loss)(model, all_indices, mask)
         updates, optim_state = optim.update(
             grads, optim_state, eqx.filter(model, eqx.is_array)
         )
         model = eqx.apply_updates(model, updates)
 
-        # evaluate the current world model in the eval data
+        # evaluation
         key, key_batch = jax.random.split(key)
-        len_data = eval_data.action.shape[0]  # type: ignore[possibly-missing-attribute]
-        eval_batch_idx = jax.random.randint(
-            key_batch, (wm_cfg.eval_batch_size,), 0, len_data
+        len_eval = eval_data.observation.shape[0]
+        # data indices where to eval the world model
+        eval_indices = jax.random.randint(
+            key_batch, (wm_cfg.eval_batch_size,), 0, len_eval
         )
 
-        # use the full eval batch for evaluation
-        eval_mask = jnp.ones(wm_cfg.eval_batch_size, dtype=bool)
-        eval_loss = _avg_loss(model, eval_data, eval_batch_idx, eval_mask)
+        # Look up pre-computed windows
+        e_obs = eval_obs[eval_indices]
+        e_act = eval_acts[eval_indices]
+        e_tgt = eval_tgts[eval_indices]
+
+        # Compute loss (reuse the batched function)
+        eval_preds = jax.vmap(model)(e_obs, e_act)
+        eval_loss = jnp.mean(optax.losses.squared_error(eval_preds, e_tgt))
 
         carry = (model, optim_state, key)
 
