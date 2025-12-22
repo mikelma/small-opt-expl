@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import numpy as np
 import os
+import time
 from evosax.problems import Problem
 
 from typing import Any, TypeAlias
@@ -57,6 +58,9 @@ class PolicyConfig:
     hdim: int = 128
     """size of the hidden layers"""
 
+    f16: bool = False
+    """use bfloat16 for weights"""
+
 
 @dataclass
 class EsConfig:
@@ -92,6 +96,9 @@ class WorldModelConfig(eqx.Module):
 
     seq_len: int = 8
     """number of observations to include as input"""
+
+    f16: bool = False
+    """use bfloat16 for weights"""
 
 
 @dataclass
@@ -205,6 +212,12 @@ def build_rollout(
     return _rollout
 
 
+def convert_bfloat16(module: eqx.Module):
+    params, static = eqx.partition(module, eqx.is_array)
+    params = jax.tree.map(lambda a: a.astype(jnp.bfloat16), params)
+    return eqx.combine(params, static)
+
+
 @eqx.filter_jit
 @jaxtyped(typechecker=typechecker)
 def compute_ece(
@@ -307,6 +320,8 @@ def compute_ece(
         obs_dim=env_params.view_size**2,
         num_actions=env_params.num_actions,
     )
+    if wm_cfg.f16:
+        model = convert_bfloat16(model)
     optim = optax.adamw(wm_cfg.learning_rate)
     optim_state = optim.init(eqx.filter(model, eqx.is_array))
 
@@ -412,28 +427,29 @@ class EceProblem(Problem):
         self.cfg = cfg
 
         key = jax.random.key(0)
-        kwpolicy = dict(
+        self.kwpolicy = dict(
             in_dim=env_params.view_size * env_params.view_size,
             out_dim=env_params.num_actions,
             hdim=cfg.policy.hdim,
         )
+        self.policy_f16 = cfg.policy.f16
 
         key = jax.random.key(0)
         population = generate_population(
-            key, population_size=cfg.es.population_size, kwpolicy=kwpolicy
+            key, population_size=cfg.es.population_size, kwpolicy=self.kwpolicy
         )
+        if self.policy_f16:
+            population = convert_bfloat16(population)
         _, self.population_static = eqx.partition(population, eqx.is_array)
 
     @partial(jax.jit, static_argnames=("self",))
     def sample(self, key: jax.Array):
         """Sample a solution in the search space."""
-        kwpolicy = dict(
-            in_dim=self.env_params.view_size * self.env_params.view_size,
-            out_dim=self.env_params.num_actions,
-            hdim=self.cfg.policy.hdim,
-        )
-        solution = RnnPolicy(key, **kwpolicy)
+        solution = generate_population(key, population_size=1, kwpolicy=self.kwpolicy)
+        if self.policy_f16:
+            solution = convert_bfloat16(solution)
         params, _static = eqx.partition(solution, eqx.is_array)
+        params = jax.tree_util.tree_map(lambda x: x[0], params)
         return params
 
     @partial(jax.jit, static_argnames=("self",))
@@ -535,7 +551,6 @@ def visualize_rollout(
 def main(args: Args):
     if args.wandb:
         import wandb
-        import time
 
         run_name = f"Env__{args.seed}__{int(time.time())}"
         wandb.init(
@@ -604,10 +619,16 @@ def main(args: Args):
 
         population, state = ask_fn(key_ask, state, params)
 
+        start = time.time()
+
         # Evaluate the fitness of the population
         fitness, problem_state, info = eval_fn(key_eval, population, problem_state)
         batched_losses = info["batched_losses"]
         interactions = info["interactions"]
+
+        fitness.block_until_ready()
+        elapsed = time.time() - start
+        print(f"   > Elapsed time evaluating policies: {round(elapsed, 3)}s\n")
 
         state, metrics = tell_fn(key_tell, population, fitness, state, params)
 
