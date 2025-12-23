@@ -58,9 +58,6 @@ class PolicyConfig:
     hdim: int = 128
     """size of the hidden layers"""
 
-    f16: bool = False
-    """use bfloat16 for weights"""
-
 
 @dataclasses.dataclass
 class EsConfig:
@@ -97,9 +94,6 @@ class WorldModelConfig(eqx.Module):
     seq_len: int = 8
     """number of observations to include as input"""
 
-    f16: bool = False
-    """use bfloat16 for weights"""
-
 
 @dataclasses.dataclass
 class Args:
@@ -118,6 +112,9 @@ class Args:
         default_factory=lambda: [0.1, 0.25, 0.5, 0.75]
     )
     """probs. of taking a random action in each pertub. set"""
+
+    f16: bool = False
+    """use bfloat16 for world model and policy weights"""
 
     save_dir: str = "images"
     """directory where images and GIFs will be saved"""
@@ -161,6 +158,8 @@ def build_rollout(
     def _rollout(
         key: PRNGKeyArray, policy: RnnPolicy, rand_act_prob: float = 0.0
     ) -> Interaction | Timestep:
+        weights_dtype = policy.rnn.weight_hh.dtype
+
         def _step(
             carry: tuple[Timestep, Float[Array, "{policy.rnn.hidden_size}"]],
             key_step: PRNGKeyArray,
@@ -172,6 +171,7 @@ def build_rollout(
 
             key_env, key_action, key_cond, key_rand = jax.random.split(key_step, num=4)
             observation = timestep.observations[0]
+            observation = observation.astype(weights_dtype)
             action, hstate = policy(key_action, observation, hstate)
 
             p = jax.random.uniform(key_cond)  # random value in the range [0, 1]
@@ -194,7 +194,7 @@ def build_rollout(
             if not return_timestep:
                 interaction = Interaction(
                     observation=observation,
-                    next_observation=timestep.observations[0],
+                    next_observation=timestep.observations[0].astype(weights_dtype),
                     action=action,
                     position=timestep.state.agents_pos[0],
                 )
@@ -208,7 +208,10 @@ def build_rollout(
         timestep = env.reset(env_params, key_reset)
 
         # Run a rollout of the policy and collect the interactions
-        init_hstate = jnp.zeros(policy.rnn.hidden_size)  # type: ignore[unresolved-attribute]
+        init_hstate = jnp.zeros(
+            policy.rnn.hidden_size,  # type: ignore[unresolved-attribute]
+            dtype=policy.rnn.weight_hh.dtype,  # type: ignore[unresolved-attribute]
+        )
         step_keys = jax.random.split(key_keys, num_timesteps)
         _carry, out = jax.lax.scan(_step, (timestep, init_hstate), step_keys)
 
@@ -347,9 +350,15 @@ def compute_ece(
         obs_dim=env_params.view_size**2,
         num_actions=env_params.num_actions,
     )
-    if wm_cfg.f16:
+    print(
+        "Eval data dtype:",
+        eval_data.observation.dtype,
+        eval_data.observation.dtype == jnp.bfloat16,
+    )
+    use_f16 = eval_data.observation.dtype == jnp.bfloat16
+    if use_f16:
         model = convert_bfloat16(model)
-    optim = optax.adamw(wm_cfg.learning_rate)
+    optim = optax.adamw(wm_cfg.learning_rate, eps=1e-4 if use_f16 else 1e-8)
     optim_state = optim.init(eqx.filter(model, eqx.is_array))
 
     batch_start_idx = jnp.arange(0, num_policy_timesteps, step=batch_size)
@@ -459,7 +468,7 @@ class EceProblem(Problem):
             out_dim=env_params.num_actions,
             hdim=cfg.policy.hdim,
         )
-        self.policy_f16 = cfg.policy.f16
+        self.policy_f16 = cfg.f16
 
         key = jax.random.key(0)
         population = generate_population(
@@ -646,6 +655,8 @@ def main(args: Args):
         key, key_ask, key_eval, key_tell, key_viz = jax.random.split(key, 5)
 
         population, state = ask_fn(key_ask, state, params)
+        if args.f16:
+            population = convert_bfloat16(population)
 
         start = time.time()
 
