@@ -113,9 +113,6 @@ class Args:
     )
     """probs. of taking a random action in each pertub. set"""
 
-    f16: bool = False
-    """use bfloat16 for world model and policy weights"""
-
     save_dir: str = "images"
     """directory where images and GIFs will be saved"""
 
@@ -207,7 +204,6 @@ def build_rollout(
         # Run a rollout of the policy and collect the interactions
         init_hstate = jnp.zeros(
             policy.rnn.hidden_size,  # type: ignore[unresolved-attribute]
-            dtype=policy.rnn.weight_hh.dtype,  # type: ignore[unresolved-attribute]
         )
         step_keys = jax.random.split(key_keys, num_timesteps)
         _carry, out = jax.lax.scan(_step, (timestep, init_hstate), step_keys)
@@ -215,12 +211,6 @@ def build_rollout(
         return out
 
     return _rollout
-
-
-def convert_bfloat16(module: eqx.Module):
-    params, static = eqx.partition(module, eqx.is_array)
-    params = jax.tree.map(lambda a: a.astype(jnp.bfloat16), params)
-    return eqx.combine(params, static)
 
 
 @jaxtyped(typechecker=typechecker)
@@ -244,7 +234,7 @@ def compute_ece(
 
         # pad observations
         obs_shape = data.observation.shape[1:]
-        zeros_obs = jnp.zeros((pad_len, *obs_shape), dtype=data.observation.dtype)
+        zeros_obs = jnp.zeros((pad_len, *obs_shape))
         padded_obs = jnp.concatenate([zeros_obs, data.observation], axis=0)
 
         # pad actions
@@ -340,16 +330,14 @@ def compute_ece(
     key_wm, key_batches, key_eval = jax.random.split(key, 3)
 
     # Initialize the world model and optimizer
-    use_f16 = eval_data.observation.dtype == jnp.bfloat16
     model = WorldModel(
         key_wm,
         seq_len=wm_cfg.seq_len,
         hdim=wm_cfg.hdim,
         obs_dim=env_params.view_size**2,
         num_actions=env_params.num_actions,
-        bfloat16=use_f16,
     )
-    optim = optax.adamw(wm_cfg.learning_rate, eps=1e-4 if use_f16 else 1e-8)
+    optim = optax.adamw(wm_cfg.learning_rate)
     optim_state = optim.init(eqx.filter(model, eqx.is_array))
 
     batch_start_idx = jnp.arange(0, num_policy_timesteps, step=batch_size)
@@ -458,9 +446,7 @@ class EceProblem(Problem):
             in_dim=env_params.view_size * env_params.view_size,
             out_dim=env_params.num_actions,
             hdim=cfg.policy.hdim,
-            bfloat16=cfg.f16,
         )
-        self.policy_f16 = cfg.f16
 
         key = jax.random.key(0)
         population = generate_population(
@@ -499,8 +485,6 @@ class EceProblem(Problem):
 
 
 def plot_eval_losses(losses, fitness, fig, ax, ymax, cmap="viridis_r"):
-    losses = np.array(losses, dtype=float)
-    fitness = np.array(fitness, dtype=float)
     pop_size = losses.shape[1]
     norm_fs = fitness - fitness.min()
     norm_fs /= norm_fs.max()
@@ -589,14 +573,10 @@ def main(args: Args):
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
-    if args.f16:
-        jax.config.update("jax_default_matmul_precision", "bfloat16")
-
     key = jax.random.key(args.seed)
 
     env = FromMap()
-    env_dtype = jnp.bfloat16 if args.f16 else jnp.float32
-    env_params = env.default_params(file_name=args.env.file_name, dtype=env_dtype)
+    env_params = env.default_params(file_name=args.env.file_name)
 
     from evosax.algorithms import Open_ES as ES
 
@@ -624,22 +604,6 @@ def main(args: Args):
     params = es.default_params  # Use default parameters
     state = es.init(key_es, solution, params)
 
-    def es_state_bf16(state):
-        opt_state = state.opt_state[0]
-        opt_state = opt_state._replace(
-            mu=opt_state.mu.astype(jnp.bfloat16), nu=opt_state.nu.astype(jnp.bfloat16)
-        )
-        state = state.replace(
-            best_solution=state.best_solution.astype(jnp.bfloat16),
-            mean=state.mean.astype(jnp.bfloat16),
-            std=state.std.astype(jnp.bfloat16),
-            opt_state=(opt_state, state.opt_state[1]),
-        )
-        return state
-
-    if args.f16:
-        state = es_state_bf16(state)
-
     # Number of parameters of policy networks
     print(
         "[*] Number of parameters of the policy network:",
@@ -665,8 +629,6 @@ def main(args: Args):
         key, key_ask, key_eval, key_tell, key_viz = jax.random.split(key, 5)
 
         population, state = ask_fn(key_ask, state, params)
-        if args.f16:
-            population = convert_bfloat16(population)
 
         start = time.time()
 
