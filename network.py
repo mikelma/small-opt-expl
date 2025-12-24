@@ -9,24 +9,35 @@ class RnnPolicy(eqx.Module):
     rnn: eqx.Module
     layers: tuple
 
-    def __init__(self, key: PRNGKeyArray, in_dim: int, out_dim: int, hdim: int = 64):
+    def __init__(
+        self,
+        key: PRNGKeyArray,
+        in_dim: int,
+        out_dim: int,
+        hdim: int = 64,
+        bfloat16: bool = False,
+    ):
+        dtype = jnp.bfloat16 if bfloat16 else jnp.float32
+
         kl0, krnn, kl1, kl2 = jax.random.split(key, 4)
 
-        self.in_layer = eqx.nn.Linear(in_dim, hdim, key=kl0)
+        self.in_layer = eqx.nn.Linear(in_dim, hdim, key=kl0, dtype=dtype)
 
-        self.rnn = eqx.nn.GRUCell(input_size=hdim, hidden_size=hdim, key=krnn)
+        self.rnn = eqx.nn.GRUCell(
+            input_size=hdim, hidden_size=hdim, key=krnn, dtype=dtype
+        )
 
         self.layers = (
-            eqx.nn.Linear(hdim, hdim, key=kl1),
-            eqx.nn.Linear(hdim, out_dim, key=kl2),
+            eqx.nn.Linear(hdim, hdim, key=kl1, dtype=dtype),
+            eqx.nn.Linear(hdim, out_dim, key=kl2, dtype=dtype),
         )
 
     def __call__(
         self,
         key: PRNGKeyArray,
         obs: Float[Array, "view_size view_size"],
-        hstate: Float[Array, "{self.rnn.hidden_size}"],
-    ) -> tuple[Integer[ScalarLike, ""], Float[Array, "{self.rnn.hidden_size}"]]:
+        hstate: Float[Array, " {self.rnn.hidden_size}"],
+    ) -> tuple[Integer[ScalarLike, ""], Float[Array, " {self.rnn.hidden_size}"]]:
         x = obs.flatten()
         x = jax.nn.relu(self.in_layer(x))
 
@@ -53,18 +64,24 @@ class WorldModel(eqx.Module):
         seq_len: int,
         hdim: int = 64,
         act_emb_size: int = 16,
+        bfloat16: bool = False,
     ):
+        dtype = jnp.bfloat16 if bfloat16 else jnp.float32
+
         kemb, kl0, kl1, kl2 = jax.random.split(key, 4)
 
         self.act_emb = eqx.nn.Embedding(
-            num_embeddings=num_actions, embedding_size=act_emb_size, key=kemb
+            num_embeddings=num_actions,
+            embedding_size=act_emb_size,
+            key=kemb,
+            dtype=dtype,
         )
 
         in_dim = seq_len * (obs_dim + act_emb_size)
         self.layers = (
-            eqx.nn.Linear(in_dim, hdim, key=kl0),
-            eqx.nn.Linear(hdim, hdim, key=kl1),
-            eqx.nn.Linear(hdim, obs_dim, key=kl2),
+            eqx.nn.Linear(in_dim, hdim, key=kl0, dtype=dtype),
+            eqx.nn.Linear(hdim, hdim, key=kl1, dtype=dtype),
+            eqx.nn.Linear(hdim, obs_dim, key=kl2, dtype=dtype),
         )
 
     def __call__(

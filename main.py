@@ -244,7 +244,7 @@ def compute_ece(
 
         # pad observations
         obs_shape = data.observation.shape[1:]
-        zeros_obs = jnp.zeros((pad_len, *obs_shape))
+        zeros_obs = jnp.zeros((pad_len, *obs_shape), dtype=data.observation.dtype)
         padded_obs = jnp.concatenate([zeros_obs, data.observation], axis=0)
 
         # pad actions
@@ -499,6 +499,8 @@ class EceProblem(Problem):
 
 
 def plot_eval_losses(losses, fitness, fig, ax, ymax, cmap="viridis_r"):
+    losses = np.array(losses, dtype=float)
+    fitness = np.array(fitness, dtype=float)
     pop_size = losses.shape[1]
     norm_fs = fitness - fitness.min()
     norm_fs /= norm_fs.max()
