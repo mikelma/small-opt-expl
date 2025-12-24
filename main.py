@@ -158,8 +158,6 @@ def build_rollout(
     def _rollout(
         key: PRNGKeyArray, policy: RnnPolicy, rand_act_prob: float = 0.0
     ) -> Interaction | Timestep:
-        weights_dtype = policy.rnn.weight_hh.dtype
-
         def _step(
             carry: tuple[Timestep, Float[Array, "{policy.rnn.hidden_size}"]],
             key_step: PRNGKeyArray,
@@ -171,7 +169,6 @@ def build_rollout(
 
             key_env, key_action, key_cond, key_rand = jax.random.split(key_step, num=4)
             observation = timestep.observations[0]
-            observation = observation.astype(weights_dtype)
             action, hstate = policy(key_action, observation, hstate)
 
             p = jax.random.uniform(key_cond)  # random value in the range [0, 1]
@@ -194,7 +191,7 @@ def build_rollout(
             if not return_timestep:
                 interaction = Interaction(
                     observation=observation,
-                    next_observation=timestep.observations[0].astype(weights_dtype),
+                    next_observation=timestep.observations[0],
                     action=action,
                     position=timestep.state.agents_pos[0],
                 )
@@ -343,21 +340,15 @@ def compute_ece(
     key_wm, key_batches, key_eval = jax.random.split(key, 3)
 
     # Initialize the world model and optimizer
+    use_f16 = eval_data.observation.dtype == jnp.bfloat16
     model = WorldModel(
         key_wm,
         seq_len=wm_cfg.seq_len,
         hdim=wm_cfg.hdim,
         obs_dim=env_params.view_size**2,
         num_actions=env_params.num_actions,
+        bfloat16=use_f16,
     )
-    print(
-        "Eval data dtype:",
-        eval_data.observation.dtype,
-        eval_data.observation.dtype == jnp.bfloat16,
-    )
-    use_f16 = eval_data.observation.dtype == jnp.bfloat16
-    if use_f16:
-        model = convert_bfloat16(model)
     optim = optax.adamw(wm_cfg.learning_rate, eps=1e-4 if use_f16 else 1e-8)
     optim_state = optim.init(eqx.filter(model, eqx.is_array))
 
@@ -467,6 +458,7 @@ class EceProblem(Problem):
             in_dim=env_params.view_size * env_params.view_size,
             out_dim=env_params.num_actions,
             hdim=cfg.policy.hdim,
+            bfloat16=cfg.f16,
         )
         self.policy_f16 = cfg.f16
 
@@ -474,16 +466,12 @@ class EceProblem(Problem):
         population = generate_population(
             key, population_size=cfg.es.population_size, kwpolicy=self.kwpolicy
         )
-        if self.policy_f16:
-            population = convert_bfloat16(population)
         _, self.population_static = eqx.partition(population, eqx.is_array)
 
     @partial(jax.jit, static_argnames=("self",))
     def sample(self, key: jax.Array):
         """Sample a solution in the search space."""
         solution = generate_population(key, population_size=1, kwpolicy=self.kwpolicy)
-        if self.policy_f16:
-            solution = convert_bfloat16(solution)
         params, _static = eqx.partition(solution, eqx.is_array)
         params = jax.tree_util.tree_map(lambda x: x[0], params)
         return params
@@ -599,10 +587,14 @@ def main(args: Args):
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
+    if args.f16:
+        jax.config.update("jax_default_matmul_precision", "bfloat16")
+
     key = jax.random.key(args.seed)
 
     env = FromMap()
-    env_params = env.default_params(file_name=args.env.file_name)
+    env_dtype = jnp.bfloat16 if args.f16 else jnp.float32
+    env_params = env.default_params(file_name=args.env.file_name, dtype=env_dtype)
 
     from evosax.algorithms import Open_ES as ES
 
@@ -629,6 +621,22 @@ def main(args: Args):
     )
     params = es.default_params  # Use default parameters
     state = es.init(key_es, solution, params)
+
+    def es_state_bf16(state):
+        opt_state = state.opt_state[0]
+        opt_state = opt_state._replace(
+            mu=opt_state.mu.astype(jnp.bfloat16), nu=opt_state.nu.astype(jnp.bfloat16)
+        )
+        state = state.replace(
+            best_solution=state.best_solution.astype(jnp.bfloat16),
+            mean=state.mean.astype(jnp.bfloat16),
+            std=state.std.astype(jnp.bfloat16),
+            opt_state=(opt_state, state.opt_state[1]),
+        )
+        return state
+
+    if args.f16:
+        state = es_state_bf16(state)
 
     # Number of parameters of policy networks
     print(
