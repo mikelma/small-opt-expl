@@ -166,6 +166,7 @@ def build_rollout(
 
             key_env, key_action, key_cond, key_rand = jax.random.split(key_step, num=4)
             observation = timestep.observations[0]
+            position = timestep.state.agents_pos[0]
             action, hstate = policy(key_action, observation, hstate)
 
             p = jax.random.uniform(key_cond)  # random value in the range [0, 1]
@@ -190,7 +191,7 @@ def build_rollout(
                     observation=observation,
                     next_observation=timestep.observations[0],
                     action=action,
-                    position=timestep.state.agents_pos[0],
+                    position=position,
                 )
 
                 return (timestep, hstate), interaction
@@ -213,6 +214,39 @@ def build_rollout(
     return _rollout
 
 
+def make_windows(
+    data: Interaction,
+    seq_len: int,
+) -> tuple[
+    Float[Array, "T seq_len view view"],
+    Float[Array, "T seq_len"],
+    Float[Array, "T view view"],
+]:
+    len_data = data.observation.shape[0]
+
+    pad_len = seq_len - 1
+
+    # pad observations
+    obs_shape = data.observation.shape[1:]
+    zeros_obs = jnp.zeros((pad_len, *obs_shape))
+    padded_obs = jnp.concatenate([zeros_obs, data.observation], axis=0)
+
+    # pad actions
+    zeros_act = jnp.zeros((pad_len,), dtype=int)
+    padded_act = jnp.concatenate([zeros_act, data.action], axis=0)
+
+    # create rolling window indices
+    # dims: (T, seq_len) -> e.g. [[0,1,2], [1,2,3], ...]
+    start_indices = jnp.arange(len_data)
+    window_indices = start_indices[:, None] + jnp.arange(seq_len)[None, :]
+
+    obs_windows = padded_obs[window_indices]
+    act_windows = padded_act[window_indices]
+    targets = data.next_observation
+
+    return obs_windows, act_windows, targets
+
+
 @jaxtyped(typechecker=typechecker)
 def compute_ece(
     key: PRNGKeyArray,
@@ -220,38 +254,7 @@ def compute_ece(
     train_data: Interaction,
     eval_data: Interaction,
     wm_cfg: WorldModelConfig,
-) -> Float[Array, " {wm_cfg.num_iterations}"]:
-    def make_windows(
-        data: Interaction,
-    ) -> tuple[
-        Float[Array, "T seq_len view view"],
-        Float[Array, "T seq_len"],
-        Float[Array, "T view view"],
-    ]:
-        len_data = data.observation.shape[0]
-
-        pad_len = wm_cfg.seq_len - 1
-
-        # pad observations
-        obs_shape = data.observation.shape[1:]
-        zeros_obs = jnp.zeros((pad_len, *obs_shape))
-        padded_obs = jnp.concatenate([zeros_obs, data.observation], axis=0)
-
-        # pad actions
-        zeros_act = jnp.zeros((pad_len,), dtype=int)
-        padded_act = jnp.concatenate([zeros_act, data.action], axis=0)
-
-        # create rolling window indices
-        # dims: (T, seq_len) -> e.g. [[0,1,2], [1,2,3], ...]
-        start_indices = jnp.arange(len_data)
-        window_indices = start_indices[:, None] + jnp.arange(wm_cfg.seq_len)[None, :]
-
-        obs_windows = padded_obs[window_indices]
-        act_windows = padded_act[window_indices]
-        targets = data.next_observation
-
-        return obs_windows, act_windows, targets
-
+) -> tuple[Float[Array, " {wm_cfg.num_iterations}"], eqx.Module]:
     # number of timesteps of a policy rollout
     num_policy_timesteps = train_data.observation.shape[0]
     # compute the world model's training batch size
@@ -260,8 +263,8 @@ def compute_ece(
     )
     batch_size = num_policy_timesteps // wm_cfg.num_iterations
 
-    train_obs, train_acts, train_tgts = make_windows(train_data)
-    eval_obs, eval_acts, eval_tgts = make_windows(eval_data)
+    train_obs, train_acts, train_tgts = make_windows(train_data, wm_cfg.seq_len)
+    eval_obs, eval_acts, eval_tgts = make_windows(eval_data, wm_cfg.seq_len)
 
     @partial(jax.vmap, in_axes=(None, 0, 0, 0))
     def _batched_loss_fn(
@@ -344,9 +347,10 @@ def compute_ece(
 
     # Run the world model train-eval loop
     carry = (model, optim_state, key_eval)
-    _carry, eval_losses = jax.lax.scan(_train_eval_step, carry, batch_start_idx)
+    carry, eval_losses = jax.lax.scan(_train_eval_step, carry, batch_start_idx)
+    learned_model = carry[0]
 
-    return eval_losses
+    return eval_losses, learned_model
 
 
 @jaxtyped(typechecker=typechecker)
@@ -366,6 +370,8 @@ def compute_fitness_repetitions(
         "{num_repetitions} {population_size} {wm_cfg.num_iterations}",
     ],
     Interaction,
+    Interaction,
+    eqx.Module,
 ]:
     rollout_fn = build_rollout(env, env_params, num_timesteps=rollout_steps)
 
@@ -386,26 +392,31 @@ def compute_fitness_repetitions(
 
     def _repeated_population_eval(
         key: PRNGKeyArray, train_data: Interaction, eval_data: Interaction
-    ) -> Float[Array, "{num_repetitions} {population_size} {wm_cfg.num_iterations}"]:
+    ) -> tuple[
+        Float[Array, "{num_repetitions} {population_size} {wm_cfg.num_iterations}"],
+        eqx.Module,
+    ]:
         @jax.vmap
         def _population_eval(
             key_eval: PRNGKeyArray, train_data: Interaction
-        ) -> Float[Array, "{population_size} {wm_cfg.num_iterations}"]:
+        ) -> tuple[
+            Float[Array, "{population_size} {wm_cfg.num_iterations}"], eqx.Module
+        ]:
             keys_fs = jax.random.split(key_eval, population_size)
             # evaluate the population based on the collected iterations
             batched_compute_fs = jax.vmap(compute_ece, in_axes=(0, None, 0, None, None))
-            fitnesses = batched_compute_fs(
+            fitnesses, models = batched_compute_fs(
                 keys_fs,
                 env_params,
                 train_data,
                 eval_data,
                 wm_cfg,
             )
-            return fitnesses
+            return fitnesses, models
 
         keys = jax.random.split(key, num_repetitions)
-        fs = _population_eval(keys, train_data)
-        return fs
+        fs, models = _population_eval(keys, train_data)
+        return fs, models
 
     def _generate_eval_set(
         key: PRNGKeyArray, probs: Float[Array, " num_probs"]
@@ -428,9 +439,9 @@ def compute_fitness_repetitions(
 
     eval_data = _generate_eval_set(key_eval, pertub_probs)
 
-    fitnesses = _repeated_population_eval(key_fs, train_data, eval_data)
+    fitnesses, models = _repeated_population_eval(key_fs, train_data, eval_data)
 
-    return fitnesses, train_data
+    return fitnesses, train_data, eval_data, models
 
 
 class EceProblem(Problem):
@@ -465,7 +476,7 @@ class EceProblem(Problem):
     @partial(jax.jit, static_argnames=("self",))
     def eval(self, key, solutions, state):
         population = eqx.combine(solutions, self.population_static)
-        batched_losses, interactions = compute_fitness_repetitions(
+        batched_losses, train_data, eval_data, models = compute_fitness_repetitions(
             key=key,
             env=self.env,
             env_params=self.env_params,
@@ -480,7 +491,12 @@ class EceProblem(Problem):
         return (
             fitness,
             state,
-            {"batched_losses": batched_losses, "interactions": interactions},
+            {
+                "batched_losses": batched_losses,
+                "train_data": train_data,
+                "eval_data": eval_data,
+                "models": models,
+            },
         )
 
 
@@ -559,6 +575,56 @@ def visualize_rollout(
     imgs[0].save(file_name, save_all=True, append_images=imgs[1:], duration=50, loop=0)
 
 
+def model_error_matrix(
+    models: eqx.Module,
+    eval_data: Interaction,
+    env_params: EnvParams,
+    index: int,
+    num_model: int = 0,
+    seq_len: int = 8,
+) -> Float[Array, "{env_params.height} {env_params.width}"]:
+    @partial(jax.vmap, in_axes=(None, 0, 0, 0))
+    def _batched_loss_fn(
+        model: eqx.Module,
+        obs_seq: Float[Array, "seq_len view view"],
+        act_seq: Integer[Array, " seq_len"],
+        target: Float[Array, "view view"],
+    ) -> Scalar:
+        pred = model(obs_seq, act_seq)  # type: ignore[non-subscriptable]
+        loss = optax.losses.squared_error(pred, target)
+        return jnp.mean(loss)
+
+    # prepare eval data (make sequences)
+    eval_obs, eval_acts, eval_tgts = make_windows(eval_data, seq_len)
+    positions = eval_data.position
+    # select the model to evaluate
+    model = jax.tree_util.tree_map(lambda x: x[num_model, index], models)
+
+    errors = _batched_loss_fn(model, eval_obs, eval_acts, eval_tgts)
+
+    def _step(carry, index):
+        mat, count = carry
+        i, j = positions[index, 0], positions[index, 1]
+        mat = mat.at[i, j].set(mat[i, j] + errors[index])
+        count = count.at[i, j].set(count[i, j] + 1)
+        return (mat, count), 0
+
+    # sum the errors at each position and count the number of data
+    # points per position in two matrices
+    indices = jnp.arange(positions.shape[0])
+    mat = jnp.zeros((env_params.height, env_params.width))
+    count = jnp.zeros((env_params.height, env_params.width))
+    carry, _ = jax.lax.scan(_step, (mat, count), indices)
+
+    # compute the average error per position
+    mat_sum, mat_count = carry
+    mat_avg = mat_sum / mat_count
+    # set the positions with no data points to nan for the sake of visualization
+    mat_avg = jnp.where(mat_count == 0, jnp.nan, mat_avg)
+
+    return mat_avg
+
+
 def main(args: Args):
     if args.wandb:
         import wandb
@@ -614,6 +680,8 @@ def main(args: Args):
     ymax = None
 
     fig2, ax2 = plt.subplots()
+    fig3, ax3 = plt.subplots()
+    cbar3 = None
 
     # get the number of empty cells in the environment (used in metrics in the main loop below)
     key, reset_key = jax.random.split(key)
@@ -635,7 +703,7 @@ def main(args: Args):
         # Evaluate the fitness of the population
         fitness, problem_state, info = eval_fn(key_eval, population, problem_state)
         batched_losses = info["batched_losses"]
-        interactions = info["interactions"]
+        interactions = info["train_data"]
 
         fitness.block_until_ready()
         elapsed = time.time() - start
@@ -707,6 +775,29 @@ def main(args: Args):
                 num_timesteps=args.env.num_timesteps,
                 file_name=f"{args.save_dir}/frames_{it + 1}.gif",
             )
+
+            start = time.time()
+            err_mat = model_error_matrix(
+                models=info["models"],
+                eval_data=info["eval_data"],
+                env_params=env_params,
+                index=int(ranking[0]),
+            )
+            err_mat.block_until_ready()
+            elapsed = round(time.time() - start, 3)
+            print(f"   > Elapsed time computing error matrix: {elapsed}s")
+            ax3.cla()
+            im3 = ax3.imshow(err_mat, vmin=0, cmap="RdYlGn_r")
+            ax3.set_title("Best agent model's avg error")
+            if cbar3 is None:
+                cbar3 = fig3.colorbar(im3, ax=ax3)
+            else:
+                cbar3.update_normal(im3)
+            if args.show:
+                fig3.canvas.draw()
+                plt.pause(1e-7)
+            else:
+                fig3.savefig(f"{args.save_dir}/errors_{it + 1}.png")
 
 
 if __name__ == "__main__":
