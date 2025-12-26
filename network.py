@@ -28,10 +28,10 @@ class RnnPolicy(eqx.Module):
         hstate: Float[Array, " {self.rnn.hidden_size}"],
     ) -> tuple[Integer[ScalarLike, ""], Float[Array, " {self.rnn.hidden_size}"]]:
         x = obs.flatten()
-        x = jax.nn.relu(self.in_layer(x))
+        x = jax.nn.relu(self.in_layer(x))  # type: ignore[call-non-callable]
 
         # apply recurrent layer
-        hstate = self.rnn(x, hstate)
+        hstate = self.rnn(x, hstate)  # type: ignore[call-non-callable]
         x = hstate
         for layer in self.layers[:-1]:
             x = jax.nn.relu(layer(x))
@@ -70,7 +70,7 @@ class WorldModel(eqx.Module):
     def __call__(
         self,
         obs: Float[Array, "seq_len view_size view_size"],
-        action: Integer[ScalarLike, "seq_len"],
+        action: Integer[ScalarLike, " seq_len"],
     ) -> Float[Array, "view_size view_size"]:
         flat_obs = obs.ravel()  # flatten the sequence of observations
         emb_act = jax.vmap(self.act_emb)(action).ravel()
