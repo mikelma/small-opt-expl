@@ -220,7 +220,7 @@ def compute_ece(
     train_data: Interaction,
     eval_data: Interaction,
     wm_cfg: WorldModelConfig,
-):
+) -> Float[Array, " {wm_cfg.num_iterations}"]:
     def make_windows(
         data: Interaction,
     ) -> tuple[
