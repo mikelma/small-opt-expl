@@ -782,6 +782,7 @@ def main(args: Args):
                 eval_data=info["eval_data"],
                 env_params=env_params,
                 index=int(ranking[0]),
+                seq_len=args.wm.seq_len,
             )
             err_mat.block_until_ready()
             elapsed = round(time.time() - start, 3)
