@@ -678,11 +678,20 @@ def main(args: Args):
     params = es.default_params  # Use default parameters
     state = es.init(key_es, solution, params)
 
-    # Number of parameters of policy networks
+    # Number of parameters of policy and world model networks
     print(
         "[*] Number of parameters of the policy network:",
         state.best_solution.shape[0],
     )
+    dummy_wm = WorldModel(
+        key,
+        seq_len=args.wm.seq_len,
+        hdim=args.wm.hdim,
+        obs_dim=env_params.view_size**2,
+        num_actions=env_params.num_actions,
+    )
+    wm_params = sum(x.size for x in jax.tree_util.tree_leaves(dummy_wm))
+    print("[*] Number of parameters of world models:", wm_params)
 
     fig1, ax1 = plt.subplots()
     ymax = None
