@@ -42,7 +42,7 @@ class RnnPolicy(eqx.Module):
 
 
 class WorldModel(eqx.Module):
-    layers: tuple
+    layers: list
 
     def __init__(
         self,
@@ -51,15 +51,23 @@ class WorldModel(eqx.Module):
         num_actions: int,
         seq_len: int,
         hdim: int = 64,
+        num_layers: int = 3,
     ):
-        kemb, kl0, kl1, kl2 = jax.random.split(key, 4)
+        assert num_layers >= 2, (
+            f"Minimum number of layers in WorldModel is 2 but got {num_layers}"
+        )
+
+        kemb, kl_in, kl_mid, kl_out = jax.random.split(key, 4)
 
         in_dim = seq_len * (obs_dim + num_actions)
-        self.layers = (
-            eqx.nn.Linear(in_dim, hdim, key=kl0),
-            eqx.nn.Linear(hdim, hdim, key=kl1),
-            eqx.nn.Linear(hdim, obs_dim, key=kl2),
-        )
+
+        self.layers = [eqx.nn.Linear(in_dim, hdim, key=kl_in)]
+
+        for _ in range(num_layers - 2):
+            kl_mid, _key = jax.random.split(kl_mid)
+            self.layers.append(eqx.nn.Linear(hdim, hdim, key=_key))
+
+        self.layers.append(eqx.nn.Linear(hdim, obs_dim, key=kl_out))
 
     def __call__(
         self,

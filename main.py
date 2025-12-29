@@ -86,8 +86,8 @@ class WorldModelConfig(eqx.Module):
     hdim: int = 128
     """size of the hidden layers"""
 
-    num_batches: int = 4
-    """number of batches to train at each train iteration"""
+    num_layers: int = 3
+    """total number of layers (including in and out)"""
 
     num_iterations: int = 32
     """number of total updates in training"""
@@ -348,6 +348,7 @@ def compute_ece(
         hdim=wm_cfg.hdim,
         obs_dim=env_params.view_size**2,
         num_actions=env_params.num_actions,
+        num_layers=wm_cfg.num_layers,
     )
     optim = optax.adamw(wm_cfg.learning_rate)
     optim_state = optim.init(eqx.filter(model, eqx.is_array))
@@ -693,6 +694,7 @@ def main(args: Args):
         hdim=args.wm.hdim,
         obs_dim=env_params.view_size**2,
         num_actions=env_params.num_actions,
+        num_layers=args.wm.num_layers,
     )
     dummy_par, _ = eqx.partition(dummy_wm, eqx.is_array)
     wm_n_par = sum(x.size for x in jax.tree_util.tree_leaves(dummy_par))
