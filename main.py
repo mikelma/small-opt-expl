@@ -279,7 +279,8 @@ def compute_ece(
         act_seq: Integer[Array, " seq_len"],
         target: Float[Array, "view view"],
     ) -> Scalar:
-        pred = model(obs_seq, act_seq)  # type: ignore[non-subscriptable]
+        one_hot_acts = jax.nn.one_hot(act_seq, env_params.num_actions, axis=-1)
+        pred = model(obs_seq, one_hot_acts)  # type: ignore[non-subscriptable]
         loss = optax.losses.squared_error(pred, target)
         return jnp.mean(loss)
 
@@ -327,6 +328,8 @@ def compute_ece(
         e_obs = eval_obs[eval_indices]
         e_act = eval_acts[eval_indices]
         e_tgt = eval_tgts[eval_indices]
+        # actions to one-hot
+        e_act = jax.nn.one_hot(e_act, env_params.num_actions, axis=-1)
 
         # Compute loss (reuse the batched function)
         eval_preds = jax.vmap(model)(e_obs, e_act)
@@ -596,7 +599,8 @@ def model_error_matrix(
         act_seq: Integer[Array, " seq_len"],
         target: Float[Array, "view view"],
     ) -> Scalar:
-        pred = model(obs_seq, act_seq)  # type: ignore[non-subscriptable]
+        one_hot_acts = jax.nn.one_hot(act_seq, env_params.num_actions, axis=-1)
+        pred = model(obs_seq, one_hot_acts)  # type: ignore[non-subscriptable]
         loss = optax.losses.squared_error(pred, target)
         return jnp.mean(loss)
 
@@ -690,8 +694,9 @@ def main(args: Args):
         obs_dim=env_params.view_size**2,
         num_actions=env_params.num_actions,
     )
-    wm_params = sum(x.size for x in jax.tree_util.tree_leaves(dummy_wm))
-    print("[*] Number of parameters of world models:", wm_params)
+    dummy_par, _ = eqx.partition(dummy_wm, eqx.is_array)
+    wm_n_par = sum(x.size for x in jax.tree_util.tree_leaves(dummy_par))
+    print("[*] Number of parameters of world models:", wm_n_par)
 
     fig1, ax1 = plt.subplots()
     ymax = None

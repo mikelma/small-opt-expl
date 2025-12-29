@@ -43,7 +43,6 @@ class RnnPolicy(eqx.Module):
 
 class WorldModel(eqx.Module):
     layers: tuple
-    act_emb: eqx.Module
 
     def __init__(
         self,
@@ -52,15 +51,10 @@ class WorldModel(eqx.Module):
         num_actions: int,
         seq_len: int,
         hdim: int = 64,
-        act_emb_size: int = 16,
     ):
         kemb, kl0, kl1, kl2 = jax.random.split(key, 4)
 
-        self.act_emb = eqx.nn.Embedding(
-            num_embeddings=num_actions, embedding_size=act_emb_size, key=kemb
-        )
-
-        in_dim = seq_len * (obs_dim + act_emb_size)
+        in_dim = seq_len * (obs_dim + num_actions)
         self.layers = (
             eqx.nn.Linear(in_dim, hdim, key=kl0),
             eqx.nn.Linear(hdim, hdim, key=kl1),
@@ -70,10 +64,10 @@ class WorldModel(eqx.Module):
     def __call__(
         self,
         obs: Float[Array, "seq_len view_size view_size"],
-        action: Integer[ScalarLike, " seq_len"],
+        one_hot_actions: Float[Array, " seq_len num_actions"],
     ) -> Float[Array, "view_size view_size"]:
         flat_obs = obs.ravel()  # flatten the sequence of observations
-        emb_act = jax.vmap(self.act_emb)(action).ravel()
+        emb_act = one_hot_actions.ravel()
 
         x = jnp.hstack((flat_obs, emb_act))
 
