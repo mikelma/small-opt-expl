@@ -50,7 +50,13 @@ OptimState: TypeAlias = Any
 @dataclasses.dataclass
 class EnvConfig:
     file_name: str = "./simple_env.txt"
+    """Path to the environment map"""
+
     num_timesteps: int = 512
+    """length of the policy rollouts"""
+
+    view_size: int = 5
+    """size of agents' view grid"""
 
 
 @dataclasses.dataclass
@@ -642,7 +648,9 @@ def main(args: Args):
     key = jax.random.key(args.seed)
 
     env = FromMap()
-    env_params = env.default_params(file_name=args.env.file_name)
+    env_params = env.default_params(
+        file_name=args.env.file_name, view_size=args.env.view_size
+    )
 
     from evosax.algorithms import Open_ES as ES
 
