@@ -115,7 +115,7 @@ class Args:
     wandb_project_name: str = "small-opt-expl"
 
     pertub_probs: list[float] = dataclasses.field(
-        default_factory=lambda: [0.1, 0.25, 0.5, 0.75]
+        default_factory=lambda: [0.25, 0.5, 0.75, 1.0]
     )
     """probs. of taking a random action in each pertub. set"""
 
