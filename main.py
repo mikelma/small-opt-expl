@@ -388,8 +388,20 @@ def compute_fitness_repetitions(
     Interaction,
     eqx.Module,
 ]:
+    n_devices = jax.local_device_count()
+    num_probs = pertub_probs.shape[0]
+    assert num_repetitions % n_devices == 0, (
+        f"num_repetitions ({num_repetitions}) must be divisible by device count ({n_devices})"
+    )
+    assert num_probs % n_devices == 0, (
+        f"pertub_probs size ({num_probs}) must be divisible by device count ({n_devices})"
+    )
+    local_probs = num_probs // n_devices
+    local_repes = num_repetitions // n_devices
+
     rollout_fn = build_rollout(env, env_params, num_timesteps=rollout_steps)
 
+    @partial(jax.pmap, in_axes=(0, None, None), static_broadcasted_argnums=(2,))
     def _population_rollout(
         key: PRNGKeyArray, rand_act_prob: float, num_repes: int
     ) -> Interaction:
@@ -405,6 +417,20 @@ def compute_fitness_repetitions(
         interactions = _repeat_rollouts(keys_repes)
         return interactions
 
+    @partial(jax.pmap, axis_name="devices", in_axes=(0, 0))
+    def _pmap_gen_eval(key_batch, probs_batch):
+        # probs_batch: (local_probs, ...)
+        @jax.vmap
+        def _do_probs(k, p):
+            keys_pop = jax.random.split(k, population_size)
+            # vmap over population with specific perturbation prob 'p'
+            return eqx.filter_vmap(rollout_fn, in_axes=(0, 0, None))(
+                keys_pop, population, p
+            )
+
+        return _do_probs(key_batch, probs_batch)
+
+    @partial(jax.pmap, in_axes=(0, 0, None))
     def _repeated_population_eval(
         key: PRNGKeyArray, train_data: Interaction, eval_data: Interaction
     ) -> tuple[
@@ -433,28 +459,61 @@ def compute_fitness_repetitions(
         fs, models = _population_eval(keys, train_data)
         return fs, models
 
-    def _generate_eval_set(
-        key: PRNGKeyArray, probs: Float[Array, " num_probs"]
-    ) -> Interaction:
-        keys = jax.random.split(key, num=probs.shape[0])
-        batched_data = eqx.filter_vmap(_population_rollout, in_axes=(0, 0, None))(
-            keys, probs, 1
-        )
-        # stack every interaction in a single dimension
-        eval_data = jax.tree_util.tree_map(
-            lambda x: x.reshape(-1, *x.shape[4:]), batched_data
-        )
-        return eval_data
+    @partial(jax.pmap, axis_name="devices", in_axes=(0, 0, None))
+    def _pmap_compute_ece(key_batch, train_data_batch, eval_data_repl):
+        # key_batch: (local_repes, ...)
+        @jax.vmap
+        def _do_eval(k, t_data):
+            keys_fs = jax.random.split(k, population_size)
+            return jax.vmap(compute_ece, in_axes=(0, None, 0, None, None))(
+                keys_fs, env_params, t_data, eval_data_repl, wm_cfg
+            )
+
+        return _do_eval(key_batch, train_data_batch)
 
     key_train, key_eval, key_fs = jax.random.split(key, num=3)
 
-    train_data = _population_rollout(
-        key_train, num_repes=num_repetitions, rand_act_prob=0.0
+    #
+    # Run policies
+    #
+    keys_train = jax.random.split(key_train, n_devices)
+    train_data_sharded = _population_rollout(keys_train, 0.0, local_repes)
+
+    #
+    # Generate eval data
+    #
+    keys_eval = jax.random.split(key_eval, num_probs).reshape(n_devices, local_probs)
+    # shape probs: (n_devices, local_probs)
+    probs_sharded = pertub_probs.reshape(n_devices, local_probs)
+    eval_data_sharded = _pmap_gen_eval(keys_eval, probs_sharded)
+
+    # flatten eval data: (n_devices, local_probs, pop_size, timesteps, ...) -> (total_samples, ...)
+    # total_samples = num_probs * population_size * timesteps
+    eval_data = jax.tree_util.tree_map(
+        lambda x: x.reshape(-1, *x.shape[4:]), eval_data_sharded
     )
 
-    eval_data = _generate_eval_set(key_eval, pertub_probs)
+    #
+    # Compute fitness
+    #
+    keys_fs = jax.random.split(key_fs, num_repetitions).reshape(n_devices, local_repes)
+    fitnesses_sharded, models_sharded = _pmap_compute_ece(
+        keys_fs, train_data_sharded, eval_data
+    )
 
-    fitnesses, models = _repeated_population_eval(key_fs, train_data, eval_data)
+    #
+    # Reshape results
+    #
+    def flatten_reps(x):
+        return x.reshape(num_repetitions, *x.shape[2:])
+
+    fitnesses = flatten_reps(fitnesses_sharded)
+    models = jax.tree_util.tree_map(flatten_reps, models_sharded)
+
+    # stack the pmap axis
+    train_data = jax.tree_util.tree_map(
+        lambda x: x.reshape(-1, *x.shape[2:]), train_data_sharded
+    )
 
     return fitnesses, train_data, eval_data, models
 
