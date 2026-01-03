@@ -5,7 +5,7 @@ import dataclasses
 import equinox as eqx
 from small_world.envs.from_map import FromMap
 from small_world.envs.randcolors import RandColors
-from small_world.utils import empty_cells_mask
+from small_world.utils import traversable_cells_mask
 from small_world.environment import Environment, EnvParams, Timestep
 from flax import struct
 from functools import partial
@@ -645,7 +645,7 @@ def main(args: Args):
     if args.wandb:
         import wandb
 
-        run_name = f"Env__{args.seed}__{int(time.time())}"
+        run_name = f"{args.env.id}__{args.seed}__{int(time.time())}"
         wandb.init(
             project=args.wandb_project_name,
             config=vars(args),
@@ -721,8 +721,8 @@ def main(args: Args):
     # get the number of empty cells in the environment (used in metrics in the main loop below)
     key, reset_key = jax.random.split(key)
     dummy_timestep = env.reset(env_params, reset_key)
-    mask = empty_cells_mask(dummy_timestep.state.grid)
-    num_empty_cells = mask.sum()
+    mask = traversable_cells_mask(dummy_timestep.state.grid)
+    num_traversable_cells = mask.sum()
 
     ask_fn = jax.jit(es.ask)
     tell_fn = jax.jit(es.tell)
@@ -775,7 +775,7 @@ def main(args: Args):
             # compute the number of unique positions that the agent with the
             # best fitness visits (on average through repetitions)
             batch_unique_visits = jax.vmap(number_unique_visits)(positions)
-            coverage_frac = (batch_unique_visits / num_empty_cells).mean()
+            coverage_frac = (batch_unique_visits / num_traversable_cells).mean()
             wandb.log({"best agents coverage frac": coverage_frac}, step=it)
 
         # --- plots --- #
