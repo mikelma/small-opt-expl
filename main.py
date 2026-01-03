@@ -4,6 +4,7 @@ import tyro
 import dataclasses
 import equinox as eqx
 from small_world.envs.from_map import FromMap
+from small_world.envs.randcolors import RandColors
 from small_world.utils import empty_cells_mask
 from small_world.environment import Environment, EnvParams, Timestep
 from flax import struct
@@ -16,6 +17,7 @@ import numpy as np
 import os
 import time
 from evosax.problems import Problem
+from evosax.algorithms import Open_ES as ES
 
 from typing import Any, TypeAlias
 from jaxtyping import (
@@ -49,8 +51,11 @@ OptimState: TypeAlias = Any
 
 @dataclasses.dataclass
 class EnvConfig:
-    file_name: str = "./simple_env.txt"
-    """Path to the environment map"""
+    id: str = "from_map"
+    """environment's identifier"""
+
+    file_name: str = "./envs/simple.txt"
+    """path to the environment map (used when env.id="from_map")"""
 
     num_timesteps: int = 512
     """length of the policy rollouts"""
@@ -652,12 +657,18 @@ def main(args: Args):
 
     key = jax.random.key(args.seed)
 
-    env = FromMap()
-    env_params = env.default_params(
-        file_name=args.env.file_name, view_size=args.env.view_size
-    )
+    if args.env.id == "from_map":
+        env = FromMap()
+        env_params = env.default_params(
+            file_name=args.env.file_name, view_size=args.env.view_size
+        )
 
-    from evosax.algorithms import Open_ES as ES
+    elif args.env.id == "randcolors":
+        env = RandColors()
+        env_params = env.default_params(view_size=args.env.view_size)
+
+    else:
+        raise Exception(f"Environment ID '{args.env.id}' not found")
 
     key, key_prob, key_sol, key_es = jax.random.split(key, 4)
     problem = EceProblem(cfg=args, env=env, env_params=env_params)
