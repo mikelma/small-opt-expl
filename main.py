@@ -107,11 +107,30 @@ class WorldModelConfig(eqx.Module):
 
 
 @dataclasses.dataclass
+class VizConfig:
+    dir: str = "images"
+    """directory where images and GIFs will be saved"""
+
+    show: bool = False
+    """plots are shown to screen if true, otherwise plots are saved to `--save-dir`"""
+
+    plot_interval: int = 1
+    """interval in which plots (e.g., loss curves) are generated"""
+
+    gif_interval: int = 10
+    """interval in which a GIF of the best agent's rollout is created"""
+
+    err_map: bool = False
+    """if set to true generates a map of the WM error at each cell"""
+
+
+@dataclasses.dataclass
 class Args:
     env: EnvConfig
     es: EsConfig
     policy: PolicyConfig
     wm: WorldModelConfig
+    viz: VizConfig
 
     seed: int = 42
 
@@ -123,18 +142,6 @@ class Args:
         default_factory=lambda: [0.25, 0.5, 0.75, 1.0]
     )
     """probs. of taking a random action in each pertub. set"""
-
-    save_dir: str = "images"
-    """directory where images and GIFs will be saved"""
-
-    show: bool = False
-    """plots are shown to screen if true, otherwise plots are saved to `--save-dir`"""
-
-    plot_interval: int = 1
-    """interval in which plots (e.g., loss curves) are generated"""
-
-    viz_rollout_interval: int = 10
-    """interval in which a GIF of the best agent's rollout is created"""
 
 
 @struct.dataclass
@@ -711,8 +718,8 @@ def main(args: Args):
             name=run_name,
         )
 
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
+    if not os.path.exists(args.viz.dir):
+        os.makedirs(args.viz.dir)
 
     key = jax.random.key(args.seed)
 
@@ -753,6 +760,7 @@ def main(args: Args):
     params = es.default_params  # Use default parameters
     state = es.init(key_es, solution, params)
 
+    print("[*] Number of XLA devices:", jax.local_device_count())
     # Number of parameters of policy and world model networks
     print(
         "[*] Number of parameters of the policy network:",
@@ -838,7 +846,9 @@ def main(args: Args):
             wandb.log({"best agents coverage frac": coverage_frac}, step=it)
 
         # --- plots --- #
-        if (it + 1) % args.plot_interval == 0 or (it + 1) == args.es.num_generations:
+        if (it + 1) % args.viz.plot_interval == 0 or (
+            it + 1
+        ) == args.es.num_generations:
             ymax = batched_losses.max() if ymax is None else ymax
             ax1.cla()
             plot_eval_losses(batched_losses, fitness, fig1, ax1, ymax)
@@ -848,18 +858,16 @@ def main(args: Args):
             ax2.set_title("Best agent's average visits per cell")
             ax2.imshow(visit_mat.mean(0))  # average across repetitions
 
-            if args.show:
+            if args.viz.show:
                 fig1.canvas.draw()
                 fig2.canvas.draw()
                 plt.pause(1e-7)
 
             else:
-                fig1.savefig(f"{args.save_dir}/losses_{it + 1}.png")
-                fig2.savefig(f"{args.save_dir}/visits_{it + 1}.png")
+                fig1.savefig(f"{args.viz.dir}/losses_{it + 1}.png")
+                fig2.savefig(f"{args.viz.dir}/visits_{it + 1}.png")
 
-        if (it + 1) % args.viz_rollout_interval == 0 or (
-            it + 1
-        ) == args.es.num_generations:
+        if (it + 1) % args.viz.gif_interval == 0 or (it + 1) == args.es.num_generations:
             visualize_rollout(
                 key=key_viz,
                 population=population,
@@ -867,32 +875,33 @@ def main(args: Args):
                 env=env,
                 env_params=env_params,
                 num_timesteps=args.env.num_timesteps,
-                file_name=f"{args.save_dir}/frames_{it + 1}.gif",
+                file_name=f"{args.viz.dir}/frames_{it + 1}.gif",
             )
 
-            start = time.time()
-            err_mat = model_error_matrix(
-                models=info["models"],
-                eval_data=info["eval_data"],
-                env_params=env_params,
-                index=int(ranking[0]),
-                seq_len=args.wm.seq_len,
-            )
-            err_mat.block_until_ready()
-            elapsed = round(time.time() - start, 3)
-            print(f"   > Elapsed time computing error matrix: {elapsed}s")
-            ax3.cla()
-            im3 = ax3.imshow(err_mat, vmin=0, cmap="RdYlGn_r")
-            ax3.set_title("Best agent model's avg error")
-            if cbar3 is None:
-                cbar3 = fig3.colorbar(im3, ax=ax3)
-            else:
-                cbar3.update_normal(im3)
-            if args.show:
-                fig3.canvas.draw()
-                plt.pause(1e-7)
-            else:
-                fig3.savefig(f"{args.save_dir}/errors_{it + 1}.png")
+            if args.viz.err_map:
+                start = time.time()
+                err_mat = model_error_matrix(
+                    models=info["models"],
+                    eval_data=info["eval_data"],
+                    env_params=env_params,
+                    index=int(ranking[0]),
+                    seq_len=args.wm.seq_len,
+                )
+                err_mat.block_until_ready()
+                elapsed = round(time.time() - start, 3)
+                print(f"   > Elapsed time computing error matrix: {elapsed}s")
+                ax3.cla()
+                im3 = ax3.imshow(err_mat, vmin=0, cmap="RdYlGn_r")
+                ax3.set_title("Best agent model's avg error")
+                if cbar3 is None:
+                    cbar3 = fig3.colorbar(im3, ax=ax3)
+                else:
+                    cbar3.update_normal(im3)
+                if args.viz.show:
+                    fig3.canvas.draw()
+                    plt.pause(1e-7)
+                else:
+                    fig3.savefig(f"{args.viz.dir}/errors_{it + 1}.png")
 
 
 if __name__ == "__main__":
