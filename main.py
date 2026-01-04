@@ -123,6 +123,9 @@ class VizConfig:
     err_map: bool = False
     """if set to true generates a map of the WM error at each cell"""
 
+    map_samples: int = 2**14
+    """num. of samples from the eval data to use for error map generation"""
+
 
 @dataclasses.dataclass
 class Args:
@@ -656,13 +659,16 @@ def visualize_rollout(
     imgs[0].save(file_name, save_all=True, append_images=imgs[1:], duration=50, loop=0)
 
 
+@partial(jax.jit, static_argnames=("seq_len", "num_samples"))
 def model_error_matrix(
+    key: PRNGKeyArray,
     models: eqx.Module,
     eval_data: Interaction,
     env_params: EnvParams,
     index: int,
     num_model: int = 0,
     seq_len: int = 8,
+    num_samples: int = 10_000,
 ) -> Float[Array, "{env_params.height} {env_params.width}"]:
     @partial(jax.vmap, in_axes=(None, 0, 0, 0))
     def _batched_loss_fn(
@@ -676,9 +682,13 @@ def model_error_matrix(
         loss = optax.losses.squared_error(pred, target)
         return jnp.mean(loss)
 
+    idx = jax.random.randint(key, (num_samples,), 0, eval_data.observation.shape[0])
     # prepare eval data (make sequences)
     eval_obs, eval_acts, eval_tgts = make_windows(eval_data, seq_len)
-    positions = eval_data.position
+    # only select some random samples (reduced compu. cost)
+    positions = eval_data.position[idx]
+    eval_obs, eval_acts, eval_tgts = eval_obs[idx], eval_acts[idx], eval_tgts[idx]
+
     # select the model to evaluate
     model = jax.tree_util.tree_map(lambda x: x[num_model, index], models)
 
@@ -846,6 +856,8 @@ def main(args: Args):
             wandb.log({"best agents coverage frac": coverage_frac}, step=it)
 
         # --- plots --- #
+        key_vizroll, key_vizmap = jax.random.split(key_viz)
+
         if (it + 1) % args.viz.plot_interval == 0 or (
             it + 1
         ) == args.es.num_generations:
@@ -869,7 +881,7 @@ def main(args: Args):
 
         if (it + 1) % args.viz.gif_interval == 0 or (it + 1) == args.es.num_generations:
             visualize_rollout(
-                key=key_viz,
+                key=key_vizroll,
                 population=population,
                 id=int(ranking[0]),
                 env=env,
@@ -881,11 +893,13 @@ def main(args: Args):
             if args.viz.err_map:
                 start = time.time()
                 err_mat = model_error_matrix(
+                    key=key_vizmap,
                     models=info["models"],
                     eval_data=info["eval_data"],
                     env_params=env_params,
                     index=int(ranking[0]),
                     seq_len=args.wm.seq_len,
+                    num_samples=args.viz.map_samples,
                 )
                 err_mat.block_until_ready()
                 elapsed = round(time.time() - start, 3)
