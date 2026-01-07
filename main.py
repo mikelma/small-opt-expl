@@ -177,7 +177,7 @@ def build_rollout(
 ) -> Callable:
     @eqx.filter_jit
     def _rollout(
-        key: PRNGKeyArray, policy: RnnPolicy, rand_act_prob: float = 0.0
+        key: PRNGKeyArray, policy: RnnPolicy, agent_id: int, rand_act_prob: float = 0.0
     ) -> Interaction | Timestep:
         def _step(
             carry: tuple[Timestep, Float[Array, "{policy.rnn.hidden_size}"]],
@@ -186,12 +186,15 @@ def build_rollout(
             tuple[Timestep, Float[Array, "{policy.rnn.hidden_size}"]],
             Interaction | Timestep,
         ]:
-            timestep, hstate = carry
+            timestep, hstates = carry
 
             key_env, key_action, key_cond, key_rand = jax.random.split(key_step, num=4)
-            observation = timestep.observations[0]
-            position = timestep.state.agents_pos[0]
-            action, hstate = policy(key_action, observation, hstate)
+
+            observations = timestep.observations
+            position = timestep.state.agents_pos[agent_id]
+
+            keys_action = jax.random.split(key_action, env_params.num_agents)
+            actions, hstates = jax.vmap(policy)(keys_action, observations, hstates)
 
             p = jax.random.uniform(key_cond)  # random value in the range [0, 1]
             action = jax.lax.cond(
@@ -199,10 +202,11 @@ def build_rollout(
                 # take a random action with unif. probability
                 lambda: jax.random.randint(key_rand, (), 0, env_params.num_actions),
                 # select policy's action
-                lambda: action,
+                lambda: actions[agent_id],
             )
 
-            actions = jnp.expand_dims(action, axis=0)
+            actions = actions.at[agent_id].set(action)
+
             timestep = env.step(
                 key_env,
                 env_params,
@@ -212,26 +216,29 @@ def build_rollout(
 
             if not return_timestep:
                 interaction = Interaction(
-                    observation=observation,
-                    next_observation=timestep.observations[0],
+                    observation=observations[agent_id],
+                    next_observation=timestep.observations[agent_id],
                     action=action,
                     position=position,
                 )
 
-                return (timestep, hstate), interaction
+                return (timestep, hstates), interaction
             else:
-                return (timestep, hstate), timestep
+                return (timestep, hstates), timestep
 
         key_reset, key_keys = jax.random.split(key)
 
         timestep = env.reset(env_params, key_reset)
 
         # Run a rollout of the policy and collect the interactions
-        init_hstate = jnp.zeros(
-            policy.rnn.hidden_size,  # type: ignore[unresolved-attribute]
+        init_hstates = jnp.zeros(
+            (
+                env_params.num_agents,
+                policy.rnn.hidden_size,  # type: ignore[unresolved-attribute]
+            )
         )
         step_keys = jax.random.split(key_keys, num_timesteps)
-        _carry, out = jax.lax.scan(_step, (timestep, init_hstate), step_keys)
+        _carry, out = jax.lax.scan(_step, (timestep, init_hstates), step_keys)
 
         return out
 
@@ -387,6 +394,7 @@ def compute_fitness_repetitions(
     population: RnnPolicy,
     env: Environment,
     env_params: EnvParams,
+    agent_id: Integer[ScalarLike, ""],
     pertub_probs: Float[Array, " num_pertub"],
     population_size: int,
     num_repetitions: int,
@@ -423,8 +431,8 @@ def compute_fitness_repetitions(
         @jax.vmap
         def _population_rollout(key: PRNGKeyArray) -> Interaction:
             keys = jax.random.split(key, population_size)
-            interactions = eqx.filter_vmap(rollout_fn, in_axes=(0, 0, None))(
-                keys, population, rand_act_prob
+            interactions = eqx.filter_vmap(rollout_fn, in_axes=(0, 0, None, None))(
+                keys, population, agent_id, rand_act_prob
             )
             return interactions
 
@@ -441,8 +449,8 @@ def compute_fitness_repetitions(
         def _run_population(k, p):
             keys_pop = jax.random.split(k, population_size)
             # vmap over population with specific perturbation prob 'p'
-            return eqx.filter_vmap(rollout_fn, in_axes=(0, 0, None))(
-                keys_pop, population, p
+            return eqx.filter_vmap(rollout_fn, in_axes=(0, 0, None, None))(
+                keys_pop, population, agent_id, p
             )
 
         return _run_population(key_batch, probs_batch)
@@ -542,12 +550,13 @@ class EceProblem(Problem):
         return params
 
     @partial(jax.jit, static_argnames=("self",))
-    def eval(self, key, solutions, state):
+    def eval(self, key, solutions, state, agent_id):
         population = eqx.combine(solutions, self.population_static)
         batched_losses, train_data, eval_data, models = compute_fitness_repetitions(
             key=key,
             env=self.env,
             env_params=self.env_params,
+            agent_id=agent_id,
             pertub_probs=self.pertub_probs,
             population=population,
             num_repetitions=self.cfg.es.num_fs_repes,
@@ -632,7 +641,9 @@ def visualize_rollout(
     policy_params = jax.tree_util.tree_map(lambda x: x[id], params)
     policy = eqx.combine(policy_params, static)
 
-    timesteps = rollout_fn(key, policy)
+    # NOTE we're taking the timesteps of the first agent (3rd arg) but it doesn't really matter,
+    # as the environment is visualized globally (same for all agent_ids)
+    timesteps = rollout_fn(key, policy, 0)
 
     frames = jax.vmap(env.render, in_axes=(None, 0, None))(env_params, timesteps, 20)
     np_frames = np.array(frames).astype(np.uint8)
@@ -799,8 +810,19 @@ def main(args: Args):
 
         start = time.time()
 
-        # Evaluate the fitness of the population
-        fitness, problem_state, info = eval_fn(key_eval, population, problem_state)
+        # Evaluate the fitness of the population (iterating over the
+        # agents in a single environment)
+        problem_state = problem_state
+        info = {}
+        fitnesses = []
+        for agent_id in range(args.env.num_agents):
+            fs, ps, inf = eval_fn(key_eval, population, problem_state, agent_id)
+            if agent_id == 0:  # NOTE only taking the info of the first agent
+                problem_state, info = ps, inf
+            fitnesses.append(fs)
+        # average across agents inside an environment
+        fitness = jnp.vstack(fitnesses).mean(0)
+
         batched_losses = info["batched_losses"]
         interactions = info["train_data"]
 
