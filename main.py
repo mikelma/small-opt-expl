@@ -245,37 +245,12 @@ def build_rollout(
     return _rollout
 
 
-def make_windows(
-    data: Interaction,
-    seq_len: int,
-) -> tuple[
-    Float[Array, "T seq_len view view"],
-    Float[Array, "T seq_len"],
-    Float[Array, "T view view"],
-]:
-    len_data = data.observation.shape[0]
-
-    pad_len = seq_len - 1
-
-    # pad observations
-    obs_shape = data.observation.shape[1:]
-    zeros_obs = jnp.zeros((pad_len, *obs_shape))
-    padded_obs = jnp.concatenate([zeros_obs, data.observation], axis=0)
-
-    # pad actions
-    zeros_act = jnp.zeros((pad_len,), dtype=int)
-    padded_act = jnp.concatenate([zeros_act, data.action], axis=0)
-
-    # create rolling window indices
-    # dims: (T, seq_len) -> e.g. [[0,1,2], [1,2,3], ...]
-    start_indices = jnp.arange(len_data)
-    window_indices = start_indices[:, None] + jnp.arange(seq_len)[None, :]
-
-    obs_windows = padded_obs[window_indices]
-    act_windows = padded_act[window_indices]
-    targets = data.next_observation
-
-    return obs_windows, act_windows, targets
+@jaxtyped(typechecker=typechecker)
+def get_window(
+    data: Array, start_idx: Integer[ScalarLike, ""], seq_len: Integer[ScalarLike, ""]
+) -> Array:
+    """Slices a contiguous window without duplicating data in memory."""
+    return jax.lax.dynamic_slice_in_dim(data, start_idx, seq_len, axis=0)  # type: ignore[invalid-argument-type]
 
 
 @jaxtyped(typechecker=typechecker)
@@ -293,32 +268,35 @@ def compute_ece(
         "Number of policy timesteps must be divisible by the number of world model train steps"
     )
     batch_size = num_policy_timesteps // wm_cfg.num_iterations
+    pad_len = wm_cfg.seq_len - 1
 
-    train_obs, train_acts, train_tgts = make_windows(train_data, wm_cfg.seq_len)
-    eval_obs, eval_acts, eval_tgts = make_windows(eval_data, wm_cfg.seq_len)
+    # pad the observation/action sequences
+    def pad_array(x, fill_val=0):
+        padding = jnp.full((pad_len, *x.shape[1:]), fill_val, dtype=x.dtype)
+        return jnp.concatenate([padding, x], axis=0)
 
-    @partial(jax.vmap, in_axes=(None, 0, 0, 0))
-    def _batched_loss_fn(
-        model: eqx.Module,
-        obs_seq: Float[Array, "seq_len view view"],
-        act_seq: Integer[Array, " seq_len"],
-        target: Float[Array, "view view"],
-    ) -> Scalar:
+    train_obs_pad = pad_array(train_data.observation)
+    train_act_pad = pad_array(train_data.action)
+    eval_obs_pad = pad_array(eval_data.observation)
+    eval_act_pad = pad_array(eval_data.action)
+
+    @partial(jax.vmap, in_axes=(None, 0))
+    def _compute_loss_at_idx(model: eqx.Module, idx: Integer[Array, ""]):
+        # Slice windows on the fly
+        obs_seq = get_window(train_obs_pad, idx, wm_cfg.seq_len)
+        act_seq = get_window(train_act_pad, idx, wm_cfg.seq_len)
+        target = train_data.next_observation[idx]
+
         one_hot_acts = jax.nn.one_hot(act_seq, env_params.num_actions, axis=-1)
-        pred = model(obs_seq, one_hot_acts)  # type: ignore[non-subscriptable]
-        loss = optax.losses.squared_error(pred, target)
-        return jnp.mean(loss)
+        pred = model(obs_seq, one_hot_acts)  # type: ignore[non-callable]
+        return jnp.mean(optax.losses.squared_error(pred, target))
 
     def _avg_loss(
         model: eqx.Module,
-        batch_idx: Integer[Array, " total_steps"],
-        mask: Bool[Array, " total_steps"],
+        indices: Integer[Array, "{num_policy_timesteps}"],
+        mask: Bool[Array, "{num_policy_timesteps}"],
     ) -> Scalar:
-        b_obs = train_obs[batch_idx]
-        b_act = train_acts[batch_idx]
-        b_tgt = train_tgts[batch_idx]
-
-        losses = _batched_loss_fn(model, b_obs, b_act, b_tgt)
+        losses = _compute_loss_at_idx(model, indices)
         losses = (losses * mask).sum() / mask.sum()
         return losses
 
@@ -331,17 +309,16 @@ def compute_ece(
         # full batch training with the data until timestep number batch_start_idx.
         # generate the mask of valid training instances according to batch_start_idx
         all_indices = jnp.arange(num_policy_timesteps)
-        valid_limit = batch_start_idx + batch_size
-        mask = all_indices < valid_limit
+        mask = all_indices < (batch_start_idx + batch_size)
 
-        # training
+        # training on all indices seen so far
         loss, grads = eqx.filter_value_and_grad(_avg_loss)(model, all_indices, mask)
         updates, optim_state = optim.update(
             grads, optim_state, eqx.filter(model, eqx.is_array)
         )
         model = eqx.apply_updates(model, updates)
 
-        # evaluation
+        # evaluation on random samples from the eval_data
         key, key_batch = jax.random.split(key)
         len_eval = eval_data.observation.shape[0]
         # data indices where to eval the world model
@@ -349,16 +326,18 @@ def compute_ece(
             key_batch, (wm_cfg.eval_batch_size,), 0, len_eval
         )
 
-        # Look up pre-computed windows
-        e_obs = eval_obs[eval_indices]
-        e_act = eval_acts[eval_indices]
-        e_tgt = eval_tgts[eval_indices]
-        # actions to one-hot
-        e_act = jax.nn.one_hot(e_act, env_params.num_actions, axis=-1)
+        # Reuse the slicing logic for evaluation
+        @partial(jax.vmap, in_axes=(None, 0))
+        def _eval_loss_at_idx(m, idx):
+            o = get_window(eval_obs_pad, idx, wm_cfg.seq_len)
+            a = jax.nn.one_hot(
+                get_window(eval_act_pad, idx, wm_cfg.seq_len), env_params.num_actions
+            )
+            return jnp.mean(
+                optax.losses.squared_error(m(o, a), eval_data.next_observation[idx])
+            )
 
-        # Compute loss (reuse the batched function)
-        eval_preds = jax.vmap(model)(e_obs, e_act)
-        eval_loss = jnp.mean(optax.losses.squared_error(eval_preds, e_tgt))
+        eval_loss = jnp.mean(_eval_loss_at_idx(model, eval_indices))
 
         carry = (model, optim_state, key)
 
@@ -526,7 +505,7 @@ class EceProblem(Problem):
         self.env_params = env_params
         self.cfg = cfg
 
-        self.pertub_probs = jnp.asarray(args.pertub_probs, dtype=float)
+        self.pertub_probs = jnp.asarray(cfg.pertub_probs, dtype=float)
 
         key = jax.random.key(0)
         self.kwpolicy = dict(
@@ -677,17 +656,33 @@ def model_error_matrix(
         loss = optax.losses.squared_error(pred, target)
         return jnp.mean(loss)
 
-    idx = jax.random.randint(key, (num_samples,), 0, eval_data.observation.shape[0])
-    # prepare eval data (make sequences)
-    eval_obs, eval_acts, eval_tgts = make_windows(eval_data, seq_len)
-    # only select some random samples (reduced compu. cost)
-    positions = eval_data.position[idx]
-    eval_obs, eval_acts, eval_tgts = eval_obs[idx], eval_acts[idx], eval_tgts[idx]
-
     # select the model to evaluate
     model = jax.tree_util.tree_map(lambda x: x[num_model, index], models)
 
-    errors = _batched_loss_fn(model, eval_obs, eval_acts, eval_tgts)
+    idx = jax.random.randint(key, (num_samples,), 0, eval_data.observation.shape[0])
+
+    pad_len = seq_len - 1
+    padded_obs = jnp.concatenate(
+        [jnp.zeros((pad_len, *eval_data.observation.shape[1:])), eval_data.observation],
+        axis=0,
+    )
+    padded_act = jnp.concatenate(
+        [jnp.zeros((pad_len,), dtype=int), eval_data.action], axis=0
+    )
+
+    @partial(jax.vmap, in_axes=(None, 0))
+    def _get_error(model, idx):
+        obs_seq = get_window(padded_obs, idx, seq_len)
+        act_seq = get_window(padded_act, idx, seq_len)
+        target = eval_data.next_observation[idx]
+        one_hot_acts = jax.nn.one_hot(act_seq, env_params.num_actions, axis=-1)
+        return jnp.mean(
+            optax.losses.squared_error(model(obs_seq, one_hot_acts), target)
+        )
+
+    idx = jax.random.randint(key, (num_samples,), 0, eval_data.observation.shape[0])
+    errors = _get_error(model, idx)
+    positions = eval_data.position[idx]
 
     def _step(carry, index):
         mat, count = carry
