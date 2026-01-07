@@ -63,6 +63,9 @@ class EnvConfig:
     view_size: int = 5
     """size of agents' view grid"""
 
+    num_agents: int = 1
+    """number of agents in the environment"""
+
 
 @dataclasses.dataclass
 class PolicyConfig:
@@ -714,18 +717,21 @@ def main(args: Args):
 
     key = jax.random.key(args.seed)
 
+    # configure and create the environment
+    env_cfg: dict[str, Any] = dict(
+        view_size=args.env.view_size,
+        num_agents=args.env.num_agents,
+    )
     if args.env.id == "from_map":
         env = FromMap()
-        env_params = env.default_params(
-            file_name=args.env.file_name, view_size=args.env.view_size
-        )
+        env_cfg["file_name"] = args.env.file_name
 
     elif args.env.id == "randcolors":
         env = RandColors()
-        env_params = env.default_params(view_size=args.env.view_size)
 
     else:
         raise Exception(f"Environment ID '{args.env.id}' not found")
+    env_params = env.default_params(**env_cfg)
 
     key, key_prob, key_sol, key_es = jax.random.split(key, 4)
     problem = EceProblem(cfg=args, env=env, env_params=env_params)
