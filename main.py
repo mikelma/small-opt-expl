@@ -396,7 +396,7 @@ def compute_fitness_repetitions(
     ],
     Interaction,
     Interaction,
-    eqx.Module,
+    WorldModel,
 ]:
     n_devices = jax.local_device_count()
     num_probs = pertub_probs.shape[0]
@@ -412,11 +412,13 @@ def compute_fitness_repetitions(
     rollout_fn = build_rollout(env, env_params, num_timesteps=rollout_steps)
 
     @partial(jax.pmap, in_axes=(0, None, None), static_broadcasted_argnums=(2,))
-    def _population_rollout(
+    def _pmap_rollouts(
         key: PRNGKeyArray, rand_act_prob: float, num_repes: int
     ) -> Interaction:
+        """runs `num_repes` rollouts of the whole population per each `rand_act_prob`"""
+
         @jax.vmap
-        def _repeat_rollouts(key: PRNGKeyArray) -> Interaction:
+        def _population_rollout(key: PRNGKeyArray) -> Interaction:
             keys = jax.random.split(key, population_size)
             interactions = eqx.filter_vmap(rollout_fn, in_axes=(0, 0, None))(
                 keys, population, rand_act_prob
@@ -424,62 +426,41 @@ def compute_fitness_repetitions(
             return interactions
 
         keys_repes = jax.random.split(key, num_repes)
-        interactions = _repeat_rollouts(keys_repes)
+        interactions = _population_rollout(keys_repes)
         return interactions
 
     @partial(jax.pmap, axis_name="devices", in_axes=(0, 0))
-    def _pmap_gen_eval(key_batch, probs_batch):
+    def _pmap_gen_eval(key_batch, probs_batch) -> Interaction:
+        """generates the evaluation dataset by running the population for each prob in `probs_batch`"""
+
         # probs_batch: (local_probs, ...)
         @jax.vmap
-        def _do_probs(k, p):
+        def _run_population(k, p):
             keys_pop = jax.random.split(k, population_size)
             # vmap over population with specific perturbation prob 'p'
             return eqx.filter_vmap(rollout_fn, in_axes=(0, 0, None))(
                 keys_pop, population, p
             )
 
-        return _do_probs(key_batch, probs_batch)
-
-    @partial(jax.pmap, in_axes=(0, 0, None))
-    def _repeated_population_eval(
-        key: PRNGKeyArray, train_data: Interaction, eval_data: Interaction
-    ) -> tuple[
-        Float[Array, "{num_repetitions} {population_size} {wm_cfg.num_iterations}"],
-        eqx.Module,
-    ]:
-        @jax.vmap
-        def _population_eval(
-            key_eval: PRNGKeyArray, train_data: Interaction
-        ) -> tuple[
-            Float[Array, "{population_size} {wm_cfg.num_iterations}"], eqx.Module
-        ]:
-            keys_fs = jax.random.split(key_eval, population_size)
-            # evaluate the population based on the collected iterations
-            batched_compute_fs = jax.vmap(compute_ece, in_axes=(0, None, 0, None, None))
-            fitnesses, models = batched_compute_fs(
-                keys_fs,
-                env_params,
-                train_data,
-                eval_data,
-                wm_cfg,
-            )
-            return fitnesses, models
-
-        keys = jax.random.split(key, num_repetitions)
-        fs, models = _population_eval(keys, train_data)
-        return fs, models
+        return _run_population(key_batch, probs_batch)
 
     @partial(jax.pmap, axis_name="devices", in_axes=(0, 0, None))
-    def _pmap_compute_ece(key_batch, train_data_batch, eval_data_repl):
-        # key_batch: (local_repes, ...)
+    def _pmap_compute_ece(
+        key: PRNGKeyArray, train_data: Interaction, eval_data: Interaction
+    ) -> tuple[
+        Float[Array, " {num_repetitions} {population_size} {wm_cfg.num_iterations}"],
+        WorldModel,
+    ]:
+        """computes the ECE of each policy rollout in `train_data` based on `eval_data`"""
+
         @jax.vmap
-        def _do_eval(k, t_data):
+        def _population_eval(k, t_data):
             keys_fs = jax.random.split(k, population_size)
             return jax.vmap(compute_ece, in_axes=(0, None, 0, None, None))(
-                keys_fs, env_params, t_data, eval_data_repl, wm_cfg
+                keys_fs, env_params, t_data, eval_data, wm_cfg
             )
 
-        return _do_eval(key_batch, train_data_batch)
+        return _population_eval(key, train_data)
 
     key_train, key_eval, key_fs = jax.random.split(key, num=3)
 
@@ -487,7 +468,7 @@ def compute_fitness_repetitions(
     # Run policies
     #
     keys_train = jax.random.split(key_train, n_devices)
-    train_data_sharded = _population_rollout(keys_train, 0.0, local_repes)
+    train_data_sharded = _pmap_rollouts(keys_train, 0.0, local_repes)
 
     #
     # Generate eval data
