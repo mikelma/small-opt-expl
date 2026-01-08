@@ -889,7 +889,8 @@ def main(args: Args):
         if (it + 1) % args.viz.plot_interval == 0 or (
             it + 1
         ) == args.es.num_generations:
-            ymax = batched_losses.max() if ymax is None else ymax
+            ylim = (batched_losses.std(0) + batched_losses.mean(0)).max()
+            ymax = ylim if ymax is None else ymax
             ax1.cla()
             plot_eval_losses(batched_losses, fitness, fig1, ax1, ymax)
 
@@ -897,6 +898,12 @@ def main(args: Args):
             visit_mat = jax.vmap(visit_matrix, in_axes=(0, None))(positions, env_params)
             ax2.set_title("Best agent's average visits per cell")
             ax2.imshow(visit_mat.mean(0))  # average across repetitions
+
+            if args.wandb:
+                wandb.log(
+                    {"best agents coverage std": visit_mat.mean(0).reshape(-1).std()},
+                    step=it,
+                )
 
             if args.viz.show:
                 fig1.canvas.draw()
