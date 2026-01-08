@@ -19,7 +19,7 @@ import time
 from evosax.problems import Problem
 from evosax.algorithms import Open_ES as ES
 
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, Literal
 from jaxtyping import (
     Float,
     Array,
@@ -51,7 +51,7 @@ OptimState: TypeAlias = Any
 
 @dataclasses.dataclass
 class EnvConfig:
-    id: str = "from_map"
+    id: Literal["from_map", "randcolors"] = "from_map"
     """environment's identifier"""
 
     file_name: str = "./envs/simple.txt"
@@ -257,6 +257,7 @@ def get_window(
 def compute_ece(
     key: PRNGKeyArray,
     env_params: EnvParams,
+    env: Environment,
     train_data: Interaction,
     eval_data: Interaction,
     wm_cfg: WorldModelConfig,
@@ -280,16 +281,27 @@ def compute_ece(
     eval_obs_pad = pad_array(eval_data.observation)
     eval_act_pad = pad_array(eval_data.action)
 
+    # determine the number of unique cell types in the environment (used
+    # for world model out shapes)
+    dummy_timestep = env.reset(env_params, key)
+    num_cells = env.num_cell_types(dummy_timestep.state)
+
     @partial(jax.vmap, in_axes=(None, 0))
     def _compute_loss_at_idx(model: eqx.Module, idx: Integer[Array, ""]):
         # Slice windows on the fly
         obs_seq = get_window(train_obs_pad, idx, wm_cfg.seq_len)
         act_seq = get_window(train_act_pad, idx, wm_cfg.seq_len)
-        target = train_data.next_observation[idx]
+        tgt_cont = train_data.next_observation[idx]
 
         one_hot_acts = jax.nn.one_hot(act_seq, env_params.num_actions, axis=-1)
-        pred = model(obs_seq, one_hot_acts)  # type: ignore[non-callable]
-        return jnp.mean(optax.losses.squared_error(pred, target))
+        logits = model(obs_seq, one_hot_acts)  # type: ignore[non-callable]
+
+        # NOTE using `dummy_timestep` as unique cells in the env are constant
+        tgt_disc = env.discretize_observation(dummy_timestep.state, tgt_cont)
+        loss = optax.losses.softmax_cross_entropy_with_integer_labels(
+            logits, tgt_disc.reshape(-1)
+        )
+        return loss.mean()
 
     def _avg_loss(
         model: eqx.Module,
@@ -328,14 +340,18 @@ def compute_ece(
 
         # Reuse the slicing logic for evaluation
         @partial(jax.vmap, in_axes=(None, 0))
-        def _eval_loss_at_idx(m, idx):
+        def _eval_loss_at_idx(model, idx):
             o = get_window(eval_obs_pad, idx, wm_cfg.seq_len)
             a = jax.nn.one_hot(
                 get_window(eval_act_pad, idx, wm_cfg.seq_len), env_params.num_actions
             )
-            return jnp.mean(
-                optax.losses.squared_error(m(o, a), eval_data.next_observation[idx])
-            )
+            tgt_cont = eval_data.next_observation[idx]
+            # NOTE using `dummy_timestep` as unique cells in the env are constant
+            tgt_disc = env.discretize_observation(dummy_timestep.state, tgt_cont)
+            logits = model(o, a)
+            return optax.softmax_cross_entropy_with_integer_labels(
+                logits, tgt_disc.reshape(-1)
+            ).mean()
 
         eval_loss = jnp.mean(_eval_loss_at_idx(model, eval_indices))
 
@@ -353,6 +369,7 @@ def compute_ece(
         obs_dim=env_params.view_size**2,
         num_actions=env_params.num_actions,
         num_layers=wm_cfg.num_layers,
+        num_cells=num_cells,
     )
     optim = optax.adamw(wm_cfg.learning_rate)
     optim_state = optim.init(eqx.filter(model, eqx.is_array))
@@ -446,8 +463,13 @@ def compute_fitness_repetitions(
         @jax.vmap
         def _population_eval(k, t_data):
             keys_fs = jax.random.split(k, population_size)
-            return jax.vmap(compute_ece, in_axes=(0, None, 0, None, None))(
-                keys_fs, env_params, t_data, eval_data, wm_cfg
+            return jax.vmap(compute_ece, in_axes=(0, None, None, 0, None, None))(
+                keys_fs,
+                env_params,
+                env,
+                t_data,
+                eval_data,
+                wm_cfg,
             )
 
         return _population_eval(key, train_data)
@@ -769,6 +791,7 @@ def main(args: Args):
         "[*] Number of parameters of the policy network:",
         state.best_solution.shape[0],
     )
+    dummy_timestep = env.reset(env_params, key)
     dummy_wm = WorldModel(
         key,
         seq_len=args.wm.seq_len,
@@ -776,6 +799,7 @@ def main(args: Args):
         obs_dim=env_params.view_size**2,
         num_actions=env_params.num_actions,
         num_layers=args.wm.num_layers,
+        num_cells=env.num_cell_types(dummy_timestep.state),
     )
     dummy_par, _ = eqx.partition(dummy_wm, eqx.is_array)
     wm_n_par = sum(x.size for x in jax.tree_util.tree_leaves(dummy_par))
