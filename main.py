@@ -655,28 +655,19 @@ def visualize_rollout(
     imgs[0].save(file_name, save_all=True, append_images=imgs[1:], duration=50, loop=0)
 
 
-@partial(jax.jit, static_argnames=("seq_len", "num_samples"))
+@partial(jax.jit, static_argnames=("seq_len", "num_samples", "env"))
 def model_error_matrix(
     key: PRNGKeyArray,
     models: eqx.Module,
     eval_data: Interaction,
     env_params: EnvParams,
+    env: Environment,
     index: int,
     num_model: int = 0,
     seq_len: int = 8,
     num_samples: int = 10_000,
 ) -> Float[Array, "{env_params.height} {env_params.width}"]:
-    @partial(jax.vmap, in_axes=(None, 0, 0, 0))
-    def _batched_loss_fn(
-        model: eqx.Module,
-        obs_seq: Float[Array, "seq_len view view"],
-        act_seq: Integer[Array, " seq_len"],
-        target: Float[Array, "view view"],
-    ) -> Scalar:
-        one_hot_acts = jax.nn.one_hot(act_seq, env_params.num_actions, axis=-1)
-        pred = model(obs_seq, one_hot_acts)  # type: ignore[non-subscriptable]
-        loss = optax.losses.squared_error(pred, target)
-        return jnp.mean(loss)
+    dummy_timestep = env.reset(env_params, key)
 
     # select the model to evaluate
     model = jax.tree_util.tree_map(lambda x: x[num_model, index], models)
@@ -698,9 +689,12 @@ def model_error_matrix(
         act_seq = get_window(padded_act, idx, seq_len)
         target = eval_data.next_observation[idx]
         one_hot_acts = jax.nn.one_hot(act_seq, env_params.num_actions, axis=-1)
-        return jnp.mean(
-            optax.losses.squared_error(model(obs_seq, one_hot_acts), target)
-        )
+
+        logits = model(obs_seq, one_hot_acts)  # type: ignore[non-subscriptable]
+        tgt_disc = env.discretize_observation(dummy_timestep.state, target).reshape(-1)
+        loss = optax.losses.softmax_cross_entropy_with_integer_labels(logits, tgt_disc)
+
+        return jnp.mean(loss)
 
     idx = jax.random.randint(key, (num_samples,), 0, eval_data.observation.shape[0])
     errors = _get_error(model, idx)
@@ -932,6 +926,7 @@ def main(args: Args):
                     models=info["models"],
                     eval_data=info["eval_data"],
                     env_params=env_params,
+                    env=env,
                     index=int(ranking[0]),
                     seq_len=args.wm.seq_len,
                     num_samples=args.viz.map_samples,
