@@ -50,6 +50,7 @@ class WorldModel(eqx.Module):
         obs_dim: int,
         num_actions: int,
         seq_len: int,
+        num_cells: int,
         hdim: int = 64,
         num_layers: int = 3,
     ):
@@ -59,21 +60,23 @@ class WorldModel(eqx.Module):
 
         kemb, kl_in, kl_mid, kl_out = jax.random.split(key, 4)
 
+        # input layer
         in_dim = seq_len * (obs_dim + num_actions)
-
         self.layers = [eqx.nn.Linear(in_dim, hdim, key=kl_in)]
 
+        # intermediate layers
         for _ in range(num_layers - 2):
             kl_mid, _key = jax.random.split(kl_mid)
             self.layers.append(eqx.nn.Linear(hdim, hdim, key=_key))
 
-        self.layers.append(eqx.nn.Linear(hdim, obs_dim, key=kl_out))
+        # output layer
+        self.layers.append(eqx.nn.Linear(hdim, obs_dim * num_cells, key=kl_out))
 
     def __call__(
         self,
         obs: Float[Array, "seq_len view_size view_size"],
         one_hot_actions: Float[Array, " seq_len num_actions"],
-    ) -> Float[Array, "view_size view_size"]:
+    ) -> Float[Array, "view_size*view_size num_cells"]:
         flat_obs = obs.ravel()  # flatten the sequence of observations
         emb_act = one_hot_actions.ravel()
 
@@ -82,9 +85,7 @@ class WorldModel(eqx.Module):
         for layer in self.layers[:-1]:
             x = jax.nn.relu(layer(x))  # TODO use tanh?
 
-        # NOTE assuming targets are always in the [-1, 1] range
-        pred = jax.nn.tanh(self.layers[-1](x))
+        logits = self.layers[-1](x)
+        logits = logits.reshape(obs.shape[1] * obs.shape[2], -1)
 
-        # reshape output to the shape of observations (ignore seq_len dim)
-        pred = pred.reshape(*obs.shape[1:])
-        return pred
+        return logits
