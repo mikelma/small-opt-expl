@@ -5,6 +5,7 @@ import dataclasses
 import equinox as eqx
 from small_world.envs.from_map import FromMap
 from small_world.envs.randcolors import RandColors
+from small_world.envs.adventure import Adventure
 from small_world.utils import traversable_cells_mask
 from small_world.environment import Environment, EnvParams, Timestep
 from flax import struct
@@ -51,7 +52,7 @@ OptimState: TypeAlias = Any
 
 @dataclasses.dataclass
 class EnvConfig:
-    id: Literal["from_map", "randcolors"] = "from_map"
+    id: Literal["from_map", "randcolors", "adventure"] = "from_map"
     """environment's identifier"""
 
     file_name: str = "./envs/simple.txt"
@@ -763,6 +764,11 @@ def main(args: Args):
     elif args.env.id == "randcolors":
         env = RandColors()
 
+    elif args.env.id == "adventure":
+        env = Adventure()
+        env_cfg["file_name"] = "./small-world/envs-txt/adventure_M.txt"
+        env_cfg["agent_init_pos"] = jnp.asarray((17, 22))
+        del env_cfg["num_agents"]
     else:
         raise Exception(f"Environment ID '{args.env.id}' not found")
     env_params = env.default_params(**env_cfg)
