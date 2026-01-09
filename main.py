@@ -194,7 +194,16 @@ def build_rollout(
             position = timestep.state.agents_pos[agent_id]
 
             keys_action = jax.random.split(key_action, env_params.num_agents)
-            actions, hstates = jax.vmap(policy)(keys_action, observations, hstates)
+
+            # run a forward pass for all agents in the environment
+            # NOTE `policy` is an ensemble of all agents in the same env
+            @eqx.filter_vmap
+            def _forward_agents(k, pol, o, h):
+                return pol(k, o, h)
+
+            actions, hstates = _forward_agents(
+                keys_action, policy, observations, hstates
+            )
 
             p = jax.random.uniform(key_cond)  # random value in the range [0, 1]
             action = jax.lax.cond(
@@ -526,6 +535,7 @@ class EceProblem(Problem):
         self.env = env
         self.env_params = env_params
         self.cfg = cfg
+        self.num_agents = cfg.env.num_agents
 
         self.pertub_probs = jnp.asarray(cfg.pertub_probs, dtype=float)
 
@@ -545,9 +555,11 @@ class EceProblem(Problem):
     @partial(jax.jit, static_argnames=("self",))
     def sample(self, key: jax.Array):
         """Sample a solution in the search space."""
-        solution = generate_population(key, population_size=1, kwpolicy=self.kwpolicy)
+        solution = generate_population(
+            key, population_size=self.num_agents, kwpolicy=self.kwpolicy
+        )
         params, _static = eqx.partition(solution, eqx.is_array)
-        params = jax.tree_util.tree_map(lambda x: x[0], params)
+        # params = jax.tree_util.tree_map(lambda x: x[0], params)
         return params
 
     @partial(jax.jit, static_argnames=("self",))
