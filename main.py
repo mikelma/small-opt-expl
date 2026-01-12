@@ -6,7 +6,7 @@ import equinox as eqx
 from small_world.envs.from_map import FromMap
 from small_world.envs.randcolors import RandColors
 from small_world.envs.adventure import Adventure
-from small_world.utils import traversable_cells_mask
+from small_world.utils import traversable_cells_mask, sample_coordinates
 from small_world.environment import Environment, EnvParams, Timestep
 from flax import struct
 from functools import partial
@@ -150,6 +150,9 @@ class Args:
     )
     """probs. of taking a random action in each pertub. set"""
 
+    eval_rand_start: bool = False
+    """force random init coords for agents when sampling for the eval dataset"""
+
 
 @struct.dataclass
 class Interaction:
@@ -178,7 +181,11 @@ def build_rollout(
 ) -> Callable:
     @eqx.filter_jit
     def _rollout(
-        key: PRNGKeyArray, policy: RnnPolicy, agent_id: int, rand_act_prob: float = 0.0
+        key: PRNGKeyArray,
+        policy: RnnPolicy,
+        agent_id: int,
+        rand_act_prob: float = 0.0,
+        rand_init_pos: bool = False,
     ) -> Interaction | Timestep:
         def _step(
             carry: tuple[Timestep, Float[Array, "{policy.rnn.hidden_size}"]],
@@ -236,9 +243,17 @@ def build_rollout(
             else:
                 return (timestep, hstates), timestep
 
-        key_reset, key_keys = jax.random.split(key)
+        key_reset, key_coord, key_keys = jax.random.split(key, num=3)
 
         timestep = env.reset(env_params, key_reset)
+
+        if rand_init_pos:
+            grid = timestep.state.grid
+            mask = traversable_cells_mask(grid)
+            coords = sample_coordinates(
+                key_coord, grid, mask, num=env_params.num_agents
+            )
+            timestep = timestep.replace(state=timestep.state.replace(agents_pos=coords))
 
         # Run a rollout of the policy and collect the interactions
         init_hstates = jnp.zeros(
@@ -405,6 +420,7 @@ def compute_fitness_repetitions(
     population_size: int,
     num_repetitions: int,
     rollout_steps: int,
+    eval_rand_init_pos: bool,
     wm_cfg: WorldModelConfig,
 ) -> tuple[
     Float[
@@ -437,9 +453,9 @@ def compute_fitness_repetitions(
         @jax.vmap
         def _population_rollout(key: PRNGKeyArray) -> Interaction:
             keys = jax.random.split(key, population_size)
-            interactions = eqx.filter_vmap(rollout_fn, in_axes=(0, 0, None, None))(
-                keys, population, agent_id, rand_act_prob
-            )
+            interactions = eqx.filter_vmap(
+                rollout_fn, in_axes=(0, 0, None, None, None)
+            )(keys, population, agent_id, rand_act_prob, False)
             return interactions
 
         keys_repes = jax.random.split(key, num_repes)
@@ -455,8 +471,8 @@ def compute_fitness_repetitions(
         def _run_population(k, p):
             keys_pop = jax.random.split(k, population_size)
             # vmap over population with specific perturbation prob 'p'
-            return eqx.filter_vmap(rollout_fn, in_axes=(0, 0, None, None))(
-                keys_pop, population, agent_id, p
+            return eqx.filter_vmap(rollout_fn, in_axes=(0, 0, None, None, None))(
+                keys_pop, population, agent_id, p, eval_rand_init_pos
             )
 
         return _run_population(key_batch, probs_batch)
@@ -577,6 +593,7 @@ class EceProblem(Problem):
             population_size=self.cfg.es.population_size,
             wm_cfg=self.cfg.wm,
             rollout_steps=self.cfg.env.num_timesteps,
+            eval_rand_init_pos=self.cfg.eval_rand_start,
         )
         fitness = batched_losses.sum(-1).mean(0)
         return (
