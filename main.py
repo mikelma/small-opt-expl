@@ -130,6 +130,9 @@ class VizConfig:
     map_samples: int = 2**14
     """num. of samples from the eval data to use for error map generation"""
 
+    save_best_interval: int = 0
+    """interval in which to save the best agent to disk (0 means disabled)"""
+
 
 @dataclasses.dataclass
 class Args:
@@ -900,6 +903,13 @@ def main(args: Args):
                 },
                 step=it,
             )
+
+        if (
+            args.viz.save_best_interval > 0
+            and (it + 1) % args.viz.save_best_interval == 0
+        ):
+            print("   > Saving best solution")
+            jnp.save(f"{args.viz.dir}/best_{it + 1}.npy", state.best_solution)
 
         # the positions in which the best agent has been
         # dims: (num_repes, num_interactions, 2)
