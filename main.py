@@ -35,7 +35,7 @@ from jaxtyping import (
 from beartype import beartype as typechecker
 
 with install_import_hook("network", "beartype.beartype"):
-    from network import RnnPolicy, WorldModel
+    from network import RnnPolicy, MlpPolicy, WorldModel
 
 # persistent compilation cache
 jax.config.update("jax_compilation_cache_dir", "./jax_cache")
@@ -166,11 +166,14 @@ class Interaction:
 
 
 def generate_population(
-    key: PRNGKeyArray, population_size: int, kwpolicy: Any = dict()
+    key: PRNGKeyArray, population_size: int, use_rnn: bool, kwpolicy: Any = dict()
 ) -> eqx.Module:
     @eqx.filter_vmap
     def _make_pop(key: PRNGKeyArray) -> eqx.Module:
-        return RnnPolicy(key, **kwpolicy)
+        if use_rnn:
+            return RnnPolicy(key, **kwpolicy)
+        else:
+            return MlpPolicy(key, **kwpolicy)
 
     keys = jax.random.split(key, population_size)
     return _make_pop(keys)
@@ -185,7 +188,7 @@ def build_rollout(
     @eqx.filter_jit
     def _rollout(
         key: PRNGKeyArray,
-        policy: RnnPolicy,
+        policy: eqx.Module,
         agent_id: int,
         rand_act_prob: float = 0.0,
         rand_init_pos: bool = False,
@@ -262,7 +265,7 @@ def build_rollout(
         init_hstates = jnp.zeros(
             (
                 env_params.num_agents,
-                policy.rnn.hidden_size,  # type: ignore[unresolved-attribute]
+                policy.in_layer.out_features,  # type: ignore[unresolved-attribute]
             )
         )
         step_keys = jax.random.split(key_keys, num_timesteps)
@@ -415,7 +418,7 @@ def compute_ece(
 @jaxtyped(typechecker=typechecker)
 def compute_fitness_repetitions(
     key: PRNGKeyArray,
-    population: RnnPolicy,
+    population: eqx.Module,
     env: Environment,
     env_params: EnvParams,
     agent_id: Integer[ScalarLike, ""],
@@ -567,16 +570,24 @@ class EceProblem(Problem):
         )
 
         key = jax.random.key(0)
+        # NOTE only using RNN agents in single-agent environments
         population = generate_population(
-            key, population_size=cfg.es.population_size, kwpolicy=self.kwpolicy
+            key,
+            population_size=cfg.es.population_size,
+            use_rnn=self.num_agents == 1,
+            kwpolicy=self.kwpolicy,
         )
         _, self.population_static = eqx.partition(population, eqx.is_array)
 
     @partial(jax.jit, static_argnames=("self",))
     def sample(self, key: jax.Array):
         """Sample a solution in the search space."""
+        # NOTE only using RNN agents in single-agent environments
         solution = generate_population(
-            key, population_size=self.num_agents, kwpolicy=self.kwpolicy
+            key,
+            population_size=self.num_agents,
+            use_rnn=self.num_agents == 1,
+            kwpolicy=self.kwpolicy,
         )
         params, _static = eqx.partition(solution, eqx.is_array)
         # params = jax.tree_util.tree_map(lambda x: x[0], params)

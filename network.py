@@ -41,6 +41,39 @@ class RnnPolicy(eqx.Module):
         return action, hstate
 
 
+class MlpPolicy(eqx.Module):
+    in_layer: eqx.Module
+    layers: tuple
+
+    def __init__(self, key: PRNGKeyArray, in_dim: int, out_dim: int, hdim: int = 64):
+        kl0, kl1, kl2, kl3 = jax.random.split(key, 4)
+
+        self.in_layer = eqx.nn.Linear(in_dim, hdim, key=kl0)
+        self.layers = (
+            eqx.nn.Linear(hdim, hdim, key=kl1),
+            eqx.nn.Linear(hdim, hdim, key=kl2),
+            eqx.nn.Linear(hdim, out_dim, key=kl3),
+        )
+
+    # NOTE the networks takes hdstate as input (although not used) only to have a compatible
+    # interaface with the RnnPolicy class and simplify logic
+    def __call__(
+        self,
+        key: PRNGKeyArray,
+        obs: Float[Array, "view_size view_size"],
+        unused_hstate: Float[Array, " hstate_dim"],
+    ) -> tuple[Integer[ScalarLike, ""], Float[Array, " hstate_dim"]]:
+        x = obs.flatten()
+        x = jax.nn.relu(self.in_layer(x))  # type: ignore[call-non-callable]
+
+        for layer in self.layers[:-1]:
+            x = jax.nn.relu(layer(x))
+
+        logits = self.layers[-1](x)
+        action = jax.random.categorical(key, logits)
+        return action, unused_hstate
+
+
 class WorldModel(eqx.Module):
     layers: list
 
