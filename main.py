@@ -10,7 +10,7 @@ from small_world.environment import Environment, EnvParams, Timestep
 from flax import struct
 from functools import partial
 import optax
-from typing import Callable
+from typing import Callable, Literal
 import matplotlib.pyplot as plt
 from PIL import Image
 import numpy as np
@@ -47,6 +47,7 @@ jax.config.update(
 
 
 OptimState: TypeAlias = Any
+Objective = Literal["ece", "surprise"]
 
 
 @dataclasses.dataclass
@@ -140,6 +141,8 @@ class Args:
     wandb: bool = False
 
     wandb_project_name: str = "small-opt-expl"
+
+    objective: Objective = "ece"
 
     pertub_probs: list[float] = dataclasses.field(
         default_factory=lambda: [0.25, 0.5, 0.75, 1.0]
@@ -378,6 +381,98 @@ def compute_ece(
     return eval_losses, learned_model
 
 
+def compute_surprise(
+    key: PRNGKeyArray,
+    env_params: EnvParams,
+    train_data: Interaction,
+    eval_data: Interaction,
+    wm_cfg: WorldModelConfig,
+) -> tuple[Float[Array, " {wm_cfg.num_iterations}"], eqx.Module]:
+    # number of timesteps of a policy rollout
+    num_policy_timesteps = train_data.observation.shape[0]
+    # compute the world model's training batch size
+    assert num_policy_timesteps % wm_cfg.num_iterations == 0, (
+        "Number of policy timesteps must be divisible by the number of world model train steps"
+    )
+    batch_size = num_policy_timesteps // wm_cfg.num_iterations
+
+    train_obs, train_acts, train_tgts = make_windows(train_data, wm_cfg.seq_len)
+    eval_obs, eval_acts, eval_tgts = make_windows(eval_data, wm_cfg.seq_len)
+
+    @partial(jax.vmap, in_axes=(None, 0, 0, 0))
+    def _batched_loss_fn(
+        model: eqx.Module,
+        obs_seq: Float[Array, "seq_len view view"],
+        act_seq: Integer[Array, " seq_len"],
+        target: Float[Array, "view view"],
+    ) -> Scalar:
+        one_hot_acts = jax.nn.one_hot(act_seq, env_params.num_actions, axis=-1)
+        pred = model(obs_seq, one_hot_acts)  # type: ignore[non-subscriptable]
+        loss = optax.losses.squared_error(pred, target)
+        return jnp.mean(loss)
+
+    def _avg_loss(
+        model: eqx.Module,
+        batch_idx: Integer[Array, " total_steps"],
+        mask: Bool[Array, " total_steps"],
+    ) -> Scalar:
+        b_obs = train_obs[batch_idx]
+        b_act = train_acts[batch_idx]
+        b_tgt = train_tgts[batch_idx]
+
+        losses = _batched_loss_fn(model, b_obs, b_act, b_tgt)
+        losses = (losses * mask).sum() / mask.sum()
+        return losses
+
+    def _train_step(
+        carry: tuple[eqx.Module, OptimState, PRNGKeyArray],
+        batch_start_idx: Integer[Array, ""],
+    ) -> tuple[tuple[eqx.Module, OptimState, PRNGKeyArray], Scalar]:
+        model, optim_state, key = carry
+
+        # full batch training with the data until timestep number batch_start_idx.
+        # generate the mask of valid training instances according to batch_start_idx
+        all_indices = jnp.arange(num_policy_timesteps)
+        valid_limit = batch_start_idx + batch_size
+        mask = all_indices < valid_limit
+
+        # training
+        loss, grads = eqx.filter_value_and_grad(_avg_loss)(model, all_indices, mask)
+        updates, optim_state = optim.update(
+            grads, optim_state, eqx.filter(model, eqx.is_array)
+        )
+        model = eqx.apply_updates(model, updates)
+
+        carry = (model, optim_state, key)
+
+        return carry, loss
+
+    key_wm, key_batches, key_eval = jax.random.split(key, 3)
+
+    # Initialize the world model and optimizer
+    model = WorldModel(
+        key_wm,
+        seq_len=wm_cfg.seq_len,
+        hdim=wm_cfg.hdim,
+        obs_dim=env_params.view_size**2,
+        num_actions=env_params.num_actions,
+        num_layers=wm_cfg.num_layers,
+    )
+    optim = optax.adamw(wm_cfg.learning_rate)
+    optim_state = optim.init(eqx.filter(model, eqx.is_array))
+
+    batch_start_idx = jnp.arange(0, num_policy_timesteps, step=batch_size)
+
+    # Run the world model's train loop
+    carry = (model, optim_state, key_eval)
+    carry, losses = jax.lax.scan(_train_step, carry, batch_start_idx)
+    learned_model = carry[0]
+
+    surprises = -losses
+
+    return surprises, learned_model
+
+
 @jaxtyped(typechecker=typechecker)
 def compute_fitness_repetitions(
     key: PRNGKeyArray,
@@ -389,6 +484,7 @@ def compute_fitness_repetitions(
     num_repetitions: int,
     rollout_steps: int,
     wm_cfg: WorldModelConfig,
+    objective: Objective = "ece",
 ) -> tuple[
     Float[
         Array,
@@ -445,7 +541,7 @@ def compute_fitness_repetitions(
         return _run_population(key_batch, probs_batch)
 
     @partial(jax.pmap, axis_name="devices", in_axes=(0, 0, None))
-    def _pmap_compute_ece(
+    def _pmap_compute_fitness(
         key: PRNGKeyArray, train_data: Interaction, eval_data: Interaction
     ) -> tuple[
         Float[Array, " {num_repetitions} {population_size} {wm_cfg.num_iterations}"],
@@ -456,7 +552,8 @@ def compute_fitness_repetitions(
         @jax.vmap
         def _population_eval(k, t_data):
             keys_fs = jax.random.split(k, population_size)
-            return jax.vmap(compute_ece, in_axes=(0, None, 0, None, None))(
+            objective_fn = compute_ece if objective == "ece" else compute_surprise
+            return jax.vmap(objective_fn, in_axes=(0, None, 0, None, None))(
                 keys_fs, env_params, t_data, eval_data, wm_cfg
             )
 
@@ -488,7 +585,7 @@ def compute_fitness_repetitions(
     # Compute fitness
     #
     keys_fs = jax.random.split(key_fs, num_repetitions).reshape(n_devices, local_repes)
-    fitnesses_sharded, models_sharded = _pmap_compute_ece(
+    fitnesses_sharded, models_sharded = _pmap_compute_fitness(
         keys_fs, train_data_sharded, eval_data
     )
 
@@ -551,6 +648,7 @@ class EceProblem(Problem):
             population_size=self.cfg.es.population_size,
             wm_cfg=self.cfg.wm,
             rollout_steps=self.cfg.env.num_timesteps,
+            objective=self.cfg.objective,
         )
         fitness = batched_losses.sum(-1).mean(0)
         return (
@@ -582,7 +680,7 @@ def plot_eval_losses(losses, fitness, fig, ax, ymax, cmap="viridis_r"):
             xx, loss_avg - loss_std, loss_avg + loss_std, alpha=0.3, color=colors[i]
         )
 
-    ax.set_ylim(0, ymax)
+    # ax.set_ylim(0, ymax)
 
 
 def number_unique_visits(
