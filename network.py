@@ -62,7 +62,15 @@ class MlpPolicy(eqx.Module):
         key: PRNGKeyArray,
         obs: Float[Array, "view_size view_size"],
         unused_hstate: Float[Array, " hstate_dim"],
-    ) -> tuple[Integer[ScalarLike, ""], Float[Array, " hstate_dim"]]:
+        return_logits: bool = False,
+    ) -> (
+        tuple[Integer[ScalarLike, ""], Float[Array, " hstate_dim"]]
+        | tuple[
+            Integer[ScalarLike, ""],
+            Float[Array, " hstate_dim"],
+            Float[Array, " num_actions"],
+        ]
+    ):
         x = obs.flatten()
         x = jax.nn.relu(self.in_layer(x))  # type: ignore[call-non-callable]
 
@@ -71,7 +79,10 @@ class MlpPolicy(eqx.Module):
 
         logits = self.layers[-1](x)
         action = jax.random.categorical(key, logits)
-        return action, unused_hstate
+        if not return_logits:
+            return action, unused_hstate
+        else:
+            return action, unused_hstate, logits
 
 
 class WorldModel(eqx.Module):
