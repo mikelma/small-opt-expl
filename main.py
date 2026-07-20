@@ -278,7 +278,11 @@ def compute_ece(
     train_data: Interaction,
     eval_data: Interaction,
     wm_cfg: WorldModelConfig,
-) -> tuple[Float[Array, " {wm_cfg.num_iterations}"], eqx.Module]:
+) -> tuple[
+    Float[Array, " {wm_cfg.num_iterations}"],
+    Float[Array, " {wm_cfg.num_iterations}"],
+    eqx.Module,
+]:
     # number of timesteps of a policy rollout
     num_policy_timesteps = train_data.observation.shape[0]
     # compute the world model's training batch size
@@ -318,7 +322,7 @@ def compute_ece(
     def _train_eval_step(
         carry: tuple[eqx.Module, OptimState, PRNGKeyArray],
         batch_start_idx: Integer[Array, ""],
-    ) -> tuple[tuple[eqx.Module, OptimState, PRNGKeyArray], Scalar]:
+    ) -> tuple[tuple[eqx.Module, OptimState, PRNGKeyArray], tuple[Scalar, Scalar]]:
         model, optim_state, key = carry
 
         # full batch training with the data until timestep number batch_start_idx.
@@ -355,7 +359,7 @@ def compute_ece(
 
         carry = (model, optim_state, key)
 
-        return carry, eval_loss
+        return carry, (eval_loss, loss)
 
     key_wm, key_batches, key_eval = jax.random.split(key, 3)
 
@@ -375,102 +379,12 @@ def compute_ece(
 
     # Run the world model train-eval loop
     carry = (model, optim_state, key_eval)
-    carry, eval_losses = jax.lax.scan(_train_eval_step, carry, batch_start_idx)
+    carry, (eval_losses, train_losses) = jax.lax.scan(
+        _train_eval_step, carry, batch_start_idx
+    )
     learned_model = carry[0]
 
-    return eval_losses, learned_model
-
-
-def compute_surprise(
-    key: PRNGKeyArray,
-    env_params: EnvParams,
-    train_data: Interaction,
-    eval_data: Interaction,
-    wm_cfg: WorldModelConfig,
-) -> tuple[Float[Array, " {wm_cfg.num_iterations}"], eqx.Module]:
-    # number of timesteps of a policy rollout
-    num_policy_timesteps = train_data.observation.shape[0]
-    # compute the world model's training batch size
-    assert num_policy_timesteps % wm_cfg.num_iterations == 0, (
-        "Number of policy timesteps must be divisible by the number of world model train steps"
-    )
-    batch_size = num_policy_timesteps // wm_cfg.num_iterations
-
-    train_obs, train_acts, train_tgts = make_windows(train_data, wm_cfg.seq_len)
-    eval_obs, eval_acts, eval_tgts = make_windows(eval_data, wm_cfg.seq_len)
-
-    @partial(jax.vmap, in_axes=(None, 0, 0, 0))
-    def _batched_loss_fn(
-        model: eqx.Module,
-        obs_seq: Float[Array, "seq_len view view"],
-        act_seq: Integer[Array, " seq_len"],
-        target: Float[Array, "view view"],
-    ) -> Scalar:
-        one_hot_acts = jax.nn.one_hot(act_seq, env_params.num_actions, axis=-1)
-        pred = model(obs_seq, one_hot_acts)  # type: ignore[non-subscriptable]
-        loss = optax.losses.squared_error(pred, target)
-        return jnp.mean(loss)
-
-    def _avg_loss(
-        model: eqx.Module,
-        batch_idx: Integer[Array, " total_steps"],
-        mask: Bool[Array, " total_steps"],
-    ) -> Scalar:
-        b_obs = train_obs[batch_idx]
-        b_act = train_acts[batch_idx]
-        b_tgt = train_tgts[batch_idx]
-
-        losses = _batched_loss_fn(model, b_obs, b_act, b_tgt)
-        losses = (losses * mask).sum() / mask.sum()
-        return losses
-
-    def _train_step(
-        carry: tuple[eqx.Module, OptimState, PRNGKeyArray],
-        batch_start_idx: Integer[Array, ""],
-    ) -> tuple[tuple[eqx.Module, OptimState, PRNGKeyArray], Scalar]:
-        model, optim_state, key = carry
-
-        # full batch training with the data until timestep number batch_start_idx.
-        # generate the mask of valid training instances according to batch_start_idx
-        all_indices = jnp.arange(num_policy_timesteps)
-        valid_limit = batch_start_idx + batch_size
-        mask = all_indices < valid_limit
-
-        # training
-        loss, grads = eqx.filter_value_and_grad(_avg_loss)(model, all_indices, mask)
-        updates, optim_state = optim.update(
-            grads, optim_state, eqx.filter(model, eqx.is_array)
-        )
-        model = eqx.apply_updates(model, updates)
-
-        carry = (model, optim_state, key)
-
-        return carry, loss
-
-    key_wm, key_batches, key_eval = jax.random.split(key, 3)
-
-    # Initialize the world model and optimizer
-    model = WorldModel(
-        key_wm,
-        seq_len=wm_cfg.seq_len,
-        hdim=wm_cfg.hdim,
-        obs_dim=env_params.view_size**2,
-        num_actions=env_params.num_actions,
-        num_layers=wm_cfg.num_layers,
-    )
-    optim = optax.adamw(wm_cfg.learning_rate)
-    optim_state = optim.init(eqx.filter(model, eqx.is_array))
-
-    batch_start_idx = jnp.arange(0, num_policy_timesteps, step=batch_size)
-
-    # Run the world model's train loop
-    carry = (model, optim_state, key_eval)
-    carry, losses = jax.lax.scan(_train_step, carry, batch_start_idx)
-    learned_model = carry[0]
-
-    surprises = -losses
-
-    return surprises, learned_model
+    return eval_losses, train_losses, learned_model
 
 
 @jaxtyped(typechecker=typechecker)
@@ -486,6 +400,10 @@ def compute_fitness_repetitions(
     wm_cfg: WorldModelConfig,
     objective: Objective = "ece",
 ) -> tuple[
+    Float[
+        Array,
+        "{num_repetitions} {population_size} {wm_cfg.num_iterations}",
+    ],
     Float[
         Array,
         "{num_repetitions} {population_size} {wm_cfg.num_iterations}",
@@ -545,6 +463,7 @@ def compute_fitness_repetitions(
         key: PRNGKeyArray, train_data: Interaction, eval_data: Interaction
     ) -> tuple[
         Float[Array, " {num_repetitions} {population_size} {wm_cfg.num_iterations}"],
+        Float[Array, " {num_repetitions} {population_size} {wm_cfg.num_iterations}"],
         WorldModel,
     ]:
         """computes the ECE of each policy rollout in `train_data` based on `eval_data`"""
@@ -552,10 +471,11 @@ def compute_fitness_repetitions(
         @jax.vmap
         def _population_eval(k, t_data):
             keys_fs = jax.random.split(k, population_size)
-            objective_fn = compute_ece if objective == "ece" else compute_surprise
-            return jax.vmap(objective_fn, in_axes=(0, None, 0, None, None))(
-                keys_fs, env_params, t_data, eval_data, wm_cfg
-            )
+            eval_losses, train_losses, models = jax.vmap(
+                compute_ece, in_axes=(0, None, 0, None, None)
+            )(keys_fs, env_params, t_data, eval_data, wm_cfg)
+            fitnesses = eval_losses if objective == "ece" else -train_losses
+            return fitnesses, eval_losses, models
 
         return _population_eval(key, train_data)
 
@@ -585,7 +505,7 @@ def compute_fitness_repetitions(
     # Compute fitness
     #
     keys_fs = jax.random.split(key_fs, num_repetitions).reshape(n_devices, local_repes)
-    fitnesses_sharded, models_sharded = _pmap_compute_fitness(
+    fitnesses_sharded, losses_sharded, models_sharded = _pmap_compute_fitness(
         keys_fs, train_data_sharded, eval_data
     )
 
@@ -596,6 +516,7 @@ def compute_fitness_repetitions(
         return x.reshape(num_repetitions, *x.shape[2:])
 
     fitnesses = flatten_reps(fitnesses_sharded)
+    eval_losses = flatten_reps(losses_sharded)
     models = jax.tree_util.tree_map(flatten_reps, models_sharded)
 
     # stack the pmap axis
@@ -603,7 +524,7 @@ def compute_fitness_repetitions(
         lambda x: x.reshape(-1, *x.shape[2:]), train_data_sharded
     )
 
-    return fitnesses, train_data, eval_data, models
+    return fitnesses, eval_losses, train_data, eval_data, models
 
 
 class EceProblem(Problem):
@@ -638,17 +559,19 @@ class EceProblem(Problem):
     @partial(jax.jit, static_argnames=("self",))
     def eval(self, key, solutions, state):
         population = eqx.combine(solutions, self.population_static)
-        batched_losses, train_data, eval_data, models = compute_fitness_repetitions(
-            key=key,
-            env=self.env,
-            env_params=self.env_params,
-            pertub_probs=self.pertub_probs,
-            population=population,
-            num_repetitions=self.cfg.es.num_fs_repes,
-            population_size=self.cfg.es.population_size,
-            wm_cfg=self.cfg.wm,
-            rollout_steps=self.cfg.env.num_timesteps,
-            objective=self.cfg.objective,
+        batched_losses, eval_losses, train_data, eval_data, models = (
+            compute_fitness_repetitions(
+                key=key,
+                env=self.env,
+                env_params=self.env_params,
+                pertub_probs=self.pertub_probs,
+                population=population,
+                num_repetitions=self.cfg.es.num_fs_repes,
+                population_size=self.cfg.es.population_size,
+                wm_cfg=self.cfg.wm,
+                rollout_steps=self.cfg.env.num_timesteps,
+                objective=self.cfg.objective,
+            )
         )
         fitness = batched_losses.sum(-1).mean(0)
         return (
@@ -656,6 +579,7 @@ class EceProblem(Problem):
             state,
             {
                 "batched_losses": batched_losses,
+                "eval_losses": eval_losses.sum(-1).mean(0),
                 "train_data": train_data,
                 "eval_data": eval_data,
                 "models": models,
@@ -919,6 +843,7 @@ def main(args: Args):
                     "mean fs": fitness.mean(),
                     "max fs": fitness.max(),
                     "min fs": fitness.min(),
+                    "mean ece": info["eval_losses"].mean(),
                 },
                 step=it,
             )
